@@ -1,0 +1,500 @@
+#!/usr/bin/python3
+"""hotspotctl - privileged helper for Hotspot Manager.
+
+Runs a Wi-Fi access point with hostapd, hands out addresses with dnsmasq and shares the
+internet connection through NAT. The GUI calls it through pkexec; `status`, `interfaces`
+and `logs` also work as a normal user.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CONF_DIR = "/etc/hotspot-manager"
+CONFIG = os.path.join(CONF_DIR, "config.json")
+PASSWORD = os.path.join(CONF_DIR, "password")
+BLOCKED = os.path.join(CONF_DIR, "blocked")
+RUN = "/run/hotspot-manager"
+HOSTAPD_CONF = os.path.join(RUN, "hostapd.conf")
+CTRL = os.path.join(RUN, "ctrl")
+LEASES = os.path.join(RUN, "dnsmasq.leases")
+DNSMASQ_PID = os.path.join(RUN, "dnsmasq.pid")
+STATE = os.path.join(RUN, "state.json")
+SERVICE = "hotspot-manager.service"
+SUBNET = "10.42.0"
+GATEWAY = SUBNET + ".1"
+
+# Non-DFS channels only: DFS needs radar detection, which most USB adapters can't do as an AP.
+CHANNELS = {"5": [36, 40, 44, 48, 149, 153, 157, 161, 165], "2.4": list(range(1, 14))}
+WIDTHS = {"5": [20, 40, 80], "2.4": [20, 40]}
+DEFAULTS = {"interface": "", "ssid": "Hotspot", "band": "5", "channel": 36, "width": 80,
+            "country": "", "hidden": False, "isolate": False, "max_clients": 0}
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+FIREWALL = [("filter", "INPUT", "HM_INPUT"), ("filter", "FORWARD", "HM_FORWARD"),
+            ("nat", "POSTROUTING", "HM_NAT")]
+
+
+class Error(Exception):
+    pass
+
+
+def run(cmd, check=True, **kw):
+    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if check and p.returncode != 0:
+        raise Error(f"{' '.join(cmd)}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def quiet(cmd, **kw):
+    return run(cmd, check=False, **kw)
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def write(path, text, mode=0o644):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)  # the O_CREAT mode is masked by umask
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(read(CONFIG) or "{}"))
+    except ValueError:
+        pass
+    return cfg
+
+
+def load_state():
+    try:
+        return json.loads(read(STATE) or "{}")
+    except ValueError:
+        return {}
+
+
+def blocked():
+    return [l.strip().lower() for l in read(BLOCKED).splitlines() if MAC_RE.match(l.strip().lower())]
+
+
+def service_state():
+    return quiet(["systemctl", "is-active", SERVICE]).stdout.strip() or "unknown"
+
+
+def need_root():
+    if os.geteuid() != 0:
+        raise Error("this command needs root (run it through pkexec or sudo)")
+
+
+# ---- adapters ---------------------------------------------------------------------------
+
+def uplinks():
+    try:
+        return {r.get("dev") for r in json.loads(quiet(["ip", "-j", "route", "show", "default"]).stdout or "[]")}
+    except ValueError:
+        return set()
+
+
+def wireless_ifaces():
+    up = uplinks()
+    res = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        phy = read(f"/sys/class/net/{name}/phy80211/name").strip()
+        if not phy:
+            continue
+        info = quiet(["iw", "phy", phy, "info"]).stdout
+        m = re.search(r"Supported interface modes:\n((?:\t\t \* .*\n)+)", info)
+        dev = os.path.realpath(f"/sys/class/net/{name}/device")
+        res.append({
+            "name": name,
+            "ap": bool(m) and any(l.strip() == "* AP" for l in m.group(1).splitlines()),
+            "uplink": name in up,
+            "usb": "/usb" in dev,
+            "driver": os.path.basename(os.path.realpath(f"/sys/class/net/{name}/device/driver")),
+            "bands": sorted({"2.4" if b == "1" else "5" for b in re.findall(r"^\tBand (\d+):", info, re.M) if b in "12"}),
+        })
+    return res
+
+
+def pick_iface(cfg):
+    want = cfg.get("interface") or ""
+    ifs = wireless_ifaces()
+    if want:
+        if any(i["name"] == want for i in ifs):
+            return want
+        raise Error(f"Wi-Fi adapter {want} not found (unplugged?)")
+    for i in ifs:
+        if i["ap"] and not i["uplink"]:
+            return i["name"]
+    raise Error("no free Wi-Fi adapter that can run a hotspot")
+
+
+def detect_country():
+    for cc in re.findall(r"^country ([A-Z]{2}):", quiet(["iw", "reg", "get"]).stdout, re.M):
+        if cc != "00":
+            return cc
+    return "US"
+
+
+# ---- hostapd config ---------------------------------------------------------------------
+
+def band_caps(phy, band):
+    """Return the (HT, VHT) capability text of one band from `iw phy info`."""
+    parts = re.split(r"\n\tBand (\d+):", quiet(["iw", "phy", phy, "info"]).stdout)
+    want = "1" if band == "2.4" else "2"
+    for num, text in zip(parts[1::2], parts[2::2]):
+        if num == want:
+            ht, _, vht = text.partition("VHT Capabilities")
+            return ht, vht
+    raise Error(f"this adapter does not support {band} GHz")
+
+
+def hostapd_conf(cfg, iface, password):
+    band, ch, width = cfg["band"], cfg["channel"], cfg["width"]
+    if ch == 165:
+        width = 20
+    phy = read(f"/sys/class/net/{iface}/phy80211/name").strip()
+    ht, vht = band_caps(phy, band)
+    # Secondary 40 MHz channel above or below the primary one.
+    plus = ch <= 7 if band == "2.4" else ((ch - (36 if ch < 149 else 149)) // 4) % 2 == 0
+    htcap = ["[HT40+]" if plus else "[HT40-]"] if width >= 40 and "HT20/HT40" in ht else []
+    htcap += [flag for needle, flag in (("RX LDPC", "[LDPC]"), ("RX HT20 SGI", "[SHORT-GI-20]"),
+                                        ("RX HT40 SGI", "[SHORT-GI-40]"), ("TX STBC", "[TX-STBC]"),
+                                        ("RX STBC 1-stream", "[RX-STBC1]")) if needle in ht]
+    lines = [
+        f"interface={iface}", "driver=nl80211", f"ctrl_interface={CTRL}", "ctrl_interface_group=0",
+        f"ssid={cfg['ssid']}", "utf8_ssid=1", f"country_code={cfg['country']}", "ieee80211d=1",
+        f"hw_mode={'a' if band == '5' else 'g'}", f"channel={ch}", "wmm_enabled=1",
+        "ieee80211n=1", f"ht_capab={''.join(htcap)}",
+    ]
+    if band == "5" and vht:
+        vcap = [flag for needle, flag in (("RX LDPC", "[RXLDPC]"), ("short GI (80 MHz)", "[SHORT-GI-80]"),
+                                          ("TX STBC", "[TX-STBC-2BY1]"),
+                                          ("Max MPDU length: 11454", "[MAX-MPDU-11454]"),
+                                          ("Max MPDU length: 7991", "[MAX-MPDU-7991]")) if needle in vht]
+        lines += ["ieee80211ac=1", f"vht_capab={''.join(vcap)}"]
+        if width == 80:
+            center = 42 if ch < 149 else 155
+            lines += ["vht_oper_chwidth=1", f"vht_oper_centr_freq_seg0_idx={center}"]
+        else:
+            lines.append("vht_oper_chwidth=0")
+    if cfg["hidden"]:
+        lines.append("ignore_broadcast_ssid=1")
+    if cfg["isolate"]:
+        lines.append("ap_isolate=1")
+    if cfg["max_clients"]:
+        lines.append(f"max_num_sta={cfg['max_clients']}")
+    lines += ["macaddr_acl=0", f"deny_mac_file={BLOCKED}", "auth_algs=1", "wpa=2",
+              "wpa_key_mgmt=WPA-PSK", "rsn_pairwise=CCMP", f"wpa_passphrase={password}"]
+    return "\n".join(lines) + "\n"
+
+
+# ---- firewall / DHCP --------------------------------------------------------------------
+
+def firewall_down():
+    for table, parent, chain in FIREWALL:
+        while quiet(["iptables", "-t", table, "-D", parent, "-j", chain]).returncode == 0:
+            pass
+        quiet(["iptables", "-t", table, "-F", chain])
+        quiet(["iptables", "-t", table, "-X", chain])
+
+
+def firewall_up(iface, isolate):
+    firewall_down()
+    net = SUBNET + ".0/24"
+    rules = {
+        "HM_INPUT": [["-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
+                     ["-i", iface, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+                     ["-i", iface, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"]],
+        "HM_FORWARD": ([["-i", iface, "-o", iface, "-j", "DROP"]] if isolate else []) + [
+                       ["-i", iface, "-s", net, "-j", "ACCEPT"],
+                       ["-o", iface, "-d", net, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]],
+        "HM_NAT": [["-s", net, "!", "-o", iface, "-j", "MASQUERADE"]],
+    }
+    # Inserted at the top so they also win over ufw/firewalld's default-drop policies.
+    for table, parent, chain in FIREWALL:
+        run(["iptables", "-t", table, "-N", chain])
+        for rule in rules[chain]:
+            run(["iptables", "-t", table, "-A", chain] + rule)
+        run(["iptables", "-t", table, "-I", parent, "1", "-j", chain])
+
+
+def stop_dnsmasq():
+    pid = read(DNSMASQ_PID).strip()
+    if pid.isdigit() and read(f"/proc/{pid}/comm").strip() == "dnsmasq":
+        os.kill(int(pid), signal.SIGTERM)
+    for f in (DNSMASQ_PID, LEASES):
+        if os.path.exists(f):
+            os.remove(f)
+
+
+def start_dnsmasq(iface):
+    stop_dnsmasq()
+    run(["dnsmasq", "--conf-file=/dev/null", "--no-hosts", f"--interface={iface}", "--bind-dynamic",
+         f"--listen-address={GATEWAY}", f"--dhcp-range={SUBNET}.10,{SUBNET}.254,255.255.255.0,12h",
+         f"--dhcp-option=option:router,{GATEWAY}", f"--dhcp-option=option:dns-server,{GATEWAY}",
+         "--dhcp-authoritative", f"--dhcp-leasefile={LEASES}", f"--pid-file={DNSMASQ_PID}"])
+
+
+def set_ip_forward(value):
+    with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+        f.write(value)
+
+
+# ---- service hooks (run by systemd) -----------------------------------------------------
+
+def pre_start():
+    """ExecStartPre: write hostapd.conf and set up addressing and NAT."""
+    cfg = load_config()
+    password = read(PASSWORD).strip()
+    if not password:
+        raise Error("no password set")
+    for attempt in range(20):  # at boot a USB adapter can show up a few seconds late
+        try:
+            iface = pick_iface(cfg)
+            break
+        except Error:
+            if attempt == 19:
+                raise
+            time.sleep(1)
+    cfg["country"] = cfg["country"] or detect_country()
+    os.makedirs(RUN, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    if not os.path.exists(BLOCKED):
+        write(BLOCKED, "")
+    write(HOSTAPD_CONF, hostapd_conf(cfg, iface, password), 0o600)
+    write(STATE, json.dumps({"interface": iface,
+                             "ip_forward": read("/proc/sys/net/ipv4/ip_forward").strip()}))
+    quiet(["nmcli", "device", "set", iface, "managed", "no"])
+    quiet(["rfkill", "unblock", "wifi"])
+    quiet(["iw", "reg", "set", cfg["country"]])
+    time.sleep(1)  # let NetworkManager/wpa_supplicant let go of the adapter
+    run(["ip", "addr", "flush", "dev", iface])
+    run(["ip", "addr", "add", GATEWAY + "/24", "dev", iface])
+    run(["ip", "link", "set", iface, "up"])
+    set_ip_forward("1")
+    firewall_up(iface, cfg["isolate"])
+
+
+def post_start():
+    """ExecStartPost: start DHCP/DNS (here, not in _pre, so systemd doesn't see a stray process)."""
+    start_dnsmasq(load_state()["interface"])
+
+
+def post_stop():
+    """ExecStopPost: undo everything pre_start did."""
+    st = load_state()
+    stop_dnsmasq()
+    firewall_down()
+    iface = st.get("interface")
+    if iface:
+        quiet(["ip", "addr", "flush", "dev", iface])
+        quiet(["nmcli", "device", "set", iface, "managed", "yes"])
+    if st.get("ip_forward") == "0":
+        set_ip_forward("0")
+    for f in (HOSTAPD_CONF, STATE):
+        if os.path.exists(f):
+            os.remove(f)
+
+
+# ---- commands ---------------------------------------------------------------------------
+
+def last_error():
+    lines = quiet(["journalctl", "-u", SERVICE, "-n", "40", "-o", "cat", "--no-pager"]).stdout.splitlines()
+    bad = [l for l in lines if re.search(r"error|fail|could not|not found|invalid|hotspotctl:", l, re.I)]
+    return (bad or lines or ["unknown error"])[-1].strip()
+
+
+def hostapd_cli(*args):
+    iface = load_state().get("interface")
+    if not iface:
+        raise Error("hotspot is not running")
+    return quiet(["hostapd_cli", "-p", CTRL, "-i", iface] + list(args))
+
+
+def cmd_start():
+    need_root()
+    run(["systemctl", "start", SERVICE])
+    for _ in range(30):  # hostapd keeps setting up after systemd considers it started
+        time.sleep(0.5)
+        state = service_state()
+        if state == "failed":
+            raise Error(last_error())
+        if state == "active" and "state=ENABLED" in hostapd_cli("status").stdout:
+            return
+    raise Error("hotspot did not come up in time: " + last_error())
+
+
+def cmd_stop():
+    need_root()
+    run(["systemctl", "stop", SERVICE])
+
+
+def cmd_restart():
+    need_root()
+    quiet(["systemctl", "stop", SERVICE])
+    cmd_start()
+
+
+def validate(cfg):
+    ssid = cfg["ssid"]
+    if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32 or any(ord(c) < 32 or ord(c) == 127 for c in ssid):
+        raise Error("network name must be 1-32 bytes with no control characters")
+    if cfg["band"] not in CHANNELS:
+        raise Error("band must be 5 or 2.4")
+    if type(cfg["channel"]) is not int or cfg["channel"] not in CHANNELS[cfg["band"]]:
+        raise Error(f"channel must be one of {CHANNELS[cfg['band']]}")
+    if type(cfg["width"]) is not int or cfg["width"] not in WIDTHS[cfg["band"]]:
+        raise Error(f"channel width must be one of {WIDTHS[cfg['band']]}")
+    if not isinstance(cfg["country"], str) or (cfg["country"] and (not re.fullmatch(r"[A-Z]{2}", cfg["country"]) or cfg["country"] == "00")):
+        raise Error("country must be a two-letter code like US or DE")
+    if not isinstance(cfg["interface"], str) or (cfg["interface"] and not IFACE_RE.match(cfg["interface"])):
+        raise Error("invalid adapter name")
+    for key in ("hidden", "isolate"):
+        if not isinstance(cfg[key], bool):
+            raise Error(f"{key} must be true or false")
+    if type(cfg["max_clients"]) is not int or not 0 <= cfg["max_clients"] <= 255:
+        raise Error("max_clients must be 0-255")
+
+
+def cmd_set_config():
+    """Read a JSON object from stdin: any config keys, plus optional "password" and "boot"."""
+    need_root()
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        raise Error("expected a JSON object on stdin")
+    if not isinstance(data, dict):
+        raise Error("expected a JSON object on stdin")
+    cfg = load_config()
+    cfg.update({k: data[k] for k in DEFAULTS if k in data})
+    validate(cfg)
+    password = data.get("password")
+    if password:
+        if not isinstance(password, str) or not 8 <= len(password) <= 63 or any(not 32 <= ord(c) <= 126 for c in password):
+            raise Error("password must be 8-63 plain characters (letters, digits, symbols)")
+    elif not read(PASSWORD).strip():
+        raise Error("set a password")
+    os.makedirs(CONF_DIR, exist_ok=True)
+    write(CONFIG, json.dumps({k: cfg[k] for k in DEFAULTS}, indent=2) + "\n")
+    if password:
+        write(PASSWORD, password + "\n", 0o600)
+    if "boot" in data:
+        run(["systemctl", "enable" if data["boot"] else "disable", SERVICE])
+    if service_state() in ("active", "activating"):
+        cmd_restart()
+
+
+def cmd_get_password():
+    need_root()
+    print(read(PASSWORD).strip())
+
+
+def mac_arg(args):
+    if len(args) != 1 or not MAC_RE.match(args[0].lower()):
+        raise Error("expected one MAC address like aa:bb:cc:dd:ee:ff")
+    return args[0].lower()
+
+
+def cmd_kick(args):
+    need_root()
+    hostapd_cli("deauthenticate", mac_arg(args))
+
+
+def cmd_block(args):
+    need_root()
+    mac = mac_arg(args)
+    macs = blocked()
+    if mac not in macs:
+        write(BLOCKED, "\n".join(macs + [mac]) + "\n")
+    if service_state() == "active":
+        hostapd_cli("deny_acl", "ADD_MAC", mac)
+        hostapd_cli("deauthenticate", mac)
+
+
+def cmd_unblock(args):
+    need_root()
+    mac = mac_arg(args)
+    macs = [m for m in blocked() if m != mac]
+    write(BLOCKED, "\n".join(macs) + ("\n" if macs else ""))
+    if service_state() == "active":
+        hostapd_cli("deny_acl", "DEL_MAC", mac)
+
+
+def cmd_status():
+    cfg = load_config()
+    state = service_state()
+    iface = load_state().get("interface", "")
+    link, clients = {}, []
+    if state == "active" and iface:
+        m = re.search(r"channel (\d+) \((\d+) MHz\), width: (\d+) MHz", quiet(["iw", "dev", iface, "info"]).stdout)
+        if m:
+            link = {"channel": int(m[1]), "freq": int(m[2]), "width": int(m[3])}
+        leases = {}
+        for line in read(LEASES).splitlines():
+            p = line.split()
+            if len(p) >= 4:
+                leases[p[1].lower()] = {"ip": p[2], "name": "" if p[3] == "*" else p[3]}
+        dump = quiet(["iw", "dev", iface, "station", "dump"]).stdout
+        for block in re.split(r"^Station ", dump, flags=re.M)[1:]:
+            mac = block.split()[0].lower()
+            f = dict(re.findall(r"^\s+([^:\n]+):\s+(.*)$", block, re.M))
+            first = lambda key: (f.get(key) or "").split(" ")[0]
+            clients.append({"mac": mac, **leases.get(mac, {"ip": "", "name": ""}),
+                            "signal": first("signal"), "down_rate": first("tx bitrate"),
+                            "up_rate": first("rx bitrate"), "down_bytes": int(first("tx bytes") or 0),
+                            "up_bytes": int(first("rx bytes") or 0),
+                            "connected": int(first("connected time") or 0)})
+    print(json.dumps({
+        "state": state,
+        "boot": quiet(["systemctl", "is-enabled", SERVICE]).stdout.strip() == "enabled",
+        "config": cfg, "interface": iface, "link": link, "clients": clients, "blocked": blocked(),
+        "error": last_error() if state == "failed" else "",
+    }))
+
+
+def cmd_logs():
+    print(quiet(["journalctl", "-u", SERVICE, "-n", "100", "-o", "short", "--no-pager"]).stdout)
+
+
+COMMANDS = {
+    "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart, "status": cmd_status,
+    "interfaces": lambda: print(json.dumps(wireless_ifaces())), "logs": cmd_logs,
+    "set-config": cmd_set_config, "get-password": cmd_get_password,
+    "_pre": lambda: (need_root(), pre_start()), "_started": lambda: (need_root(), post_start()),
+    "_post": lambda: (need_root(), post_stop()),
+}
+MAC_COMMANDS = {"kick": cmd_kick, "block": cmd_block, "unblock": cmd_unblock}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in {**COMMANDS, **MAC_COMMANDS}:
+        print("usage: hotspotctl start|stop|restart|status|interfaces|logs|set-config|get-password|"
+              "kick MAC|block MAC|unblock MAC", file=sys.stderr)
+        sys.exit(2)
+    cmd = sys.argv[1]
+    try:
+        if cmd in MAC_COMMANDS:
+            MAC_COMMANDS[cmd](sys.argv[2:])
+        else:
+            COMMANDS[cmd]()
+    except Error as e:
+        print(f"hotspotctl: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

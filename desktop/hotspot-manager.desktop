@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Hotspot Manager
+Comment=Turn the Wi-Fi hotspot on/off, change its password and manage connected devices
+Exec=/usr/local/bin/hotspot-manager
+Icon=network-wireless-hotspot
+Terminal=false
+Type=Application
+Categories=Network;Settings;
+Keywords=hotspot;wifi;access point;hostapd;tethering;
+StartupWMClass=hotspot-manager

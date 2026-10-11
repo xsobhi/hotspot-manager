@@ -1,0 +1,429 @@
+#!/usr/bin/python3
+"""Hotspot Manager - control a hostapd Wi-Fi hotspot from the desktop."""
+import json
+import secrets
+import shutil
+import string
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib, Gtk  # noqa: E402
+
+HELPER = "/usr/local/bin/hotspotctl"
+CHANNELS = {"5": [36, 40, 44, 48, 149, 153, 157, 161, 165], "2.4": list(range(1, 14))}
+WIDTHS = {"5": [20, 40, 80], "2.4": [20, 40]}
+STATE_TEXT = {"active": "On", "activating": "Starting…", "deactivating": "Stopping…",
+              "inactive": "Off", "failed": "Failed"}
+
+
+def helper(*args, root=False, data=None):
+    cmd = (["pkexec", HELPER] if root else [HELPER]) + list(args)
+    p = subprocess.run(cmd, input=data, capture_output=True, text=True)
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout).strip() or f"{args[0]} failed"
+        raise RuntimeError(msg.removeprefix("hotspotctl: "))
+    return p.stdout
+
+
+def in_thread(work, done):
+    """Run work() off the UI thread, then done(result, error) back on it."""
+    def target():
+        try:
+            res, err = work(), None
+        except Exception as e:  # shown to the user in the info bar
+            res, err = None, str(e)
+        GLib.idle_add(lambda: done(res, err) and False)
+    threading.Thread(target=target, daemon=True).start()
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def human_time(s):
+    h, m = divmod(s // 60, 60)
+    return f"{h}h {m}m" if h else f"{m}m {s % 60}s"
+
+
+def wifi_qr_text(ssid, password, hidden):
+    esc = lambda s: "".join("\\" + c if c in '\\;,":' else c for c in s)
+    return f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(password)};{'H:true;' if hidden else ''};"
+
+
+class HotspotWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Hotspot Manager")
+        self.set_default_size(680, 560)
+        self.set_icon_name("network-wireless-hotspot")
+        self.status = {}
+        self.password = None
+        self.settings_loaded = False
+        self.busy = False
+        self.polling = False
+        self.shown_blocked = None
+
+        header = Gtk.HeaderBar(show_close_button=True, title="Hotspot Manager")
+        self.set_titlebar(header)
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Turn the hotspot on or off")
+        self.switch_handler = self.switch.connect("notify::active", self.on_switch)
+        header.pack_end(self.switch)
+        share = Gtk.Button(label="Share", tooltip_text="Show the name, password and a QR code to join")
+        share.connect("clicked", self.on_share)
+        header.pack_start(share)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(box)
+        self.infobar = Gtk.InfoBar(show_close_button=True, revealed=False)
+        self.info_label = Gtk.Label(wrap=True, xalign=0)
+        self.infobar.get_content_area().add(self.info_label)
+        self.infobar.connect("response", lambda bar, _r: bar.set_revealed(False))
+        box.pack_start(self.infobar, False, False, 0)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=16)
+        self.state_label = Gtk.Label(xalign=0)
+        self.summary_label = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.summary_label.get_style_context().add_class("dim-label")
+        top.add(self.state_label)
+        top.add(self.summary_label)
+        box.pack_start(top, False, False, 0)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        box.pack_start(Gtk.StackSwitcher(stack=self.stack, halign=Gtk.Align.CENTER), False, False, 0)
+        box.pack_start(self.stack, True, True, 0)
+        self.stack.add_titled(self.build_devices(), "devices", "Devices")
+        self.stack.add_titled(self.build_settings(), "settings", "Settings")
+        self.stack.add_titled(self.build_log(), "log", "Log")
+        self.stack.connect("notify::visible-child-name", self.on_page)
+
+        self.set_state_text("Loading…", "")
+        in_thread(lambda: json.loads(helper("interfaces")), self.on_interfaces)
+        in_thread(lambda: helper("get-password", root=True).strip(), self.on_password)
+
+    # ---- pages -------------------------------------------------------------------------
+
+    def build_devices(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        # name, ip, mac, signal, link speed, time connected, data used
+        self.devices = Gtk.ListStore(str, str, str, str, str, str, str)
+        self.device_view = Gtk.TreeView(model=self.devices)
+        for i, title in enumerate(["Device", "IP", "MAC", "Signal", "Link ↓ / ↑", "Connected", "Data ↓ / ↑"]):
+            col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i)
+            col.set_resizable(True)
+            self.device_view.append_column(col)
+        scroll = Gtk.ScrolledWindow(vexpand=True, shadow_type=Gtk.ShadowType.IN)
+        scroll.add(self.device_view)
+        box.pack_start(scroll, True, True, 0)
+
+        buttons = Gtk.Box(spacing=6)
+        for label, action, tip in (("Disconnect", "kick", "Kick the device off (it can reconnect)"),
+                                   ("Block", "block", "Kick the device off and stop it from reconnecting")):
+            b = Gtk.Button(label=label, tooltip_text=tip)
+            b.connect("clicked", self.on_device_action, action)
+            buttons.pack_start(b, False, False, 0)
+        box.pack_start(buttons, False, False, 0)
+
+        box.pack_start(Gtk.Label(label="<b>Blocked devices</b>", use_markup=True, xalign=0), False, False, 6)
+        self.blocked_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.pack_start(self.blocked_box, False, False, 0)
+        return box
+
+    def build_settings(self):
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
+        rows = []
+
+        self.ssid = Gtk.Entry(max_length=32)
+        rows.append(("Network name", self.ssid))
+
+        self.pw = Gtk.Entry(visibility=False, max_length=63, placeholder_text="Loading…")
+        self.pw.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        self.pw.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Show / hide password")
+        self.pw.connect("icon-press", lambda e, *_: e.set_visibility(not e.get_visibility()))
+        gen = Gtk.Button(label="Generate")
+        gen.connect("clicked", self.on_generate)
+        pwbox = Gtk.Box(spacing=6)
+        pwbox.pack_start(self.pw, True, True, 0)
+        pwbox.pack_start(gen, False, False, 0)
+        rows.append(("Password", pwbox))
+
+        self.band = Gtk.ComboBoxText()
+        self.band.append("5", "5 GHz (faster)")
+        self.band.append("2.4", "2.4 GHz (longer range, older devices)")
+        self.band.connect("changed", self.on_band)
+        rows.append(("Band", self.band))
+        self.channel = Gtk.ComboBoxText()
+        rows.append(("Channel", self.channel))
+        self.width = Gtk.ComboBoxText()
+        rows.append(("Channel width", self.width))
+        self.country = Gtk.Entry(max_length=2, width_chars=4, placeholder_text="auto",
+                                 tooltip_text="Two-letter country code; sets which channels and power are legal")
+        rows.append(("Country", self.country))
+        self.adapter = Gtk.ComboBoxText()
+        rows.append(("Wi-Fi adapter", self.adapter))
+        self.max_clients = Gtk.SpinButton.new_with_range(0, 64, 1)
+        self.max_clients.set_tooltip_text("0 = no limit")
+        rows.append(("Max devices (0 = no limit)", self.max_clients))
+        self.hidden = Gtk.CheckButton(label="Hide network name")
+        self.isolate = Gtk.CheckButton(label="Stop connected devices from seeing each other")
+        self.boot = Gtk.CheckButton(label="Turn on automatically at startup")
+        rows += [("", self.hidden), ("", self.isolate), ("", self.boot)]
+
+        for n, (label, widget) in enumerate(rows):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, n, 1, 1)
+            widget.set_hexpand(True)
+            grid.attach(widget, 1, n, 1, 1)
+        save = Gtk.Button(label="Save and apply", halign=Gtk.Align.END)
+        save.get_style_context().add_class("suggested-action")
+        save.connect("clicked", self.on_save)
+        grid.attach(save, 1, len(rows), 1, 1)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(grid)
+        return scroll
+
+    def build_log(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=12)
+        self.log_view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        scroll = Gtk.ScrolledWindow(vexpand=True, shadow_type=Gtk.ShadowType.IN)
+        scroll.add(self.log_view)
+        box.pack_start(scroll, True, True, 0)
+        refresh = Gtk.Button(label="Refresh", halign=Gtk.Align.END)
+        refresh.connect("clicked", lambda *_: self.load_log())
+        box.pack_start(refresh, False, False, 0)
+        return box
+
+    # ---- status ------------------------------------------------------------------------
+
+    def notify(self, text, error=False):
+        self.info_label.set_text(text)
+        self.infobar.set_message_type(Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO)
+        self.infobar.set_revealed(True)
+
+    def set_state_text(self, state, summary):
+        self.state_label.set_markup(f"<span size='x-large' weight='bold'>{GLib.markup_escape_text(state)}</span>")
+        self.summary_label.set_text(summary)
+
+    def poll(self):
+        if not self.polling:
+            self.polling = True
+            in_thread(lambda: json.loads(helper("status")), self.on_status)
+        return True
+
+    def on_status(self, st, err):
+        self.polling = False
+        if err:
+            self.set_state_text("Hotspot status unavailable", err)
+            return
+        self.status = st
+        cfg, link, clients = st["config"], st["link"], st["clients"]
+        state = st["state"]
+        if not self.busy:
+            self.switch.handler_block(self.switch_handler)
+            self.switch.set_active(state in ("active", "activating"))
+            self.switch.handler_unblock(self.switch_handler)
+        if state == "active":
+            n = len(clients)
+            summary = (f"{cfg['ssid']}  ·  {cfg['band']} GHz  ·  channel {link.get('channel', cfg['channel'])}"
+                       f"  ·  {link.get('width', cfg['width'])} MHz  ·  {n} device{'s' if n != 1 else ''} connected")
+        elif state == "failed":
+            summary = st["error"]
+        else:
+            summary = f"{cfg['ssid']}  ·  {cfg['band']} GHz"
+        self.set_state_text(f"Hotspot {STATE_TEXT.get(state, state)}", summary)
+        if not self.settings_loaded:
+            self.fill_settings(cfg, st["boot"])
+        self.fill_devices(clients)
+        self.fill_blocked(st["blocked"], clients)
+
+    def fill_devices(self, clients):
+        model, it = self.device_view.get_selection().get_selected()
+        selected = model[it][2] if it else None
+        self.devices.clear()
+        for c in clients:
+            it = self.devices.append([
+                c["name"] or "Unknown", c["ip"], c["mac"], f"{c['signal']} dBm" if c["signal"] else "",
+                f"{c['down_rate']} / {c['up_rate']} Mbps", human_time(c["connected"]),
+                f"{human_bytes(c['down_bytes'])} / {human_bytes(c['up_bytes'])}"])
+            if c["mac"] == selected:
+                self.device_view.get_selection().select_iter(it)
+
+    def fill_blocked(self, macs, clients):
+        if macs == self.shown_blocked:
+            return
+        self.shown_blocked = macs
+        for child in self.blocked_box.get_children():
+            self.blocked_box.remove(child)
+        names = {c["mac"]: c["name"] for c in clients}
+        if not macs:
+            self.blocked_box.add(Gtk.Label(label="None", xalign=0, margin=6))
+        for mac in macs:
+            row = Gtk.Box(spacing=6, margin=4)
+            row.pack_start(Gtk.Label(label=f"{mac}  {names.get(mac, '')}", xalign=0), True, True, 0)
+            b = Gtk.Button(label="Unblock")
+            b.connect("clicked", lambda _b, m=mac: self.action(lambda: helper("unblock", m, root=True), f"Unblocked {m}"))
+            row.pack_start(b, False, False, 0)
+            self.blocked_box.add(row)
+        self.blocked_box.show_all()
+
+    # ---- settings ----------------------------------------------------------------------
+
+    def on_interfaces(self, ifaces, err):
+        if err:
+            self.notify(f"Could not list Wi-Fi adapters: {err}", error=True)
+            ifaces = []
+        for i in ifaces:
+            notes = ["USB" if i["usb"] else "built-in", i["driver"], "/".join(f"{b} GHz" for b in i["bands"])]
+            if i["uplink"]:
+                notes.append("in use for internet")
+            if not i["ap"]:
+                notes.append("can't host")
+            self.adapter.append(i["name"], f"{i['name']}  ({', '.join(n for n in notes if n)})")
+        # Start polling only now, so the adapter list is filled before the settings are.
+        self.poll()
+        GLib.timeout_add_seconds(2, self.poll)
+
+    def on_password(self, pw, err):
+        if err:
+            self.pw.set_placeholder_text("Could not read the password")
+            return
+        self.password = pw
+        self.pw.set_text(pw)
+        self.pw.set_placeholder_text("8–63 characters")
+
+    def fill_settings(self, cfg, boot):
+        self.settings_loaded = True
+        self.ssid.set_text(cfg["ssid"])
+        self.band.set_active_id(cfg["band"])
+        self.on_band()
+        self.channel.set_active_id(str(cfg["channel"]))
+        self.width.set_active_id(str(cfg["width"]))
+        self.country.set_text(cfg["country"])
+        if not self.adapter.set_active_id(cfg["interface"]) and cfg["interface"]:
+            self.adapter.append(cfg["interface"], f"{cfg['interface']}  (not plugged in)")
+            self.adapter.set_active_id(cfg["interface"])
+        self.max_clients.set_value(cfg["max_clients"])
+        self.hidden.set_active(cfg["hidden"])
+        self.isolate.set_active(cfg["isolate"])
+        self.boot.set_active(boot)
+
+    def on_band(self, *_):
+        band = self.band.get_active_id() or "5"
+        channel, width = self.channel.get_active_id(), self.width.get_active_id()
+        self.channel.remove_all()
+        for c in CHANNELS[band]:
+            self.channel.append(str(c), str(c))
+        if not self.channel.set_active_id(channel or ""):
+            self.channel.set_active(0)
+        self.width.remove_all()
+        for w in WIDTHS[band]:
+            self.width.append(str(w), f"{w} MHz" + ("  (fastest)" if w == max(WIDTHS[band]) else ""))
+        if not self.width.set_active_id(width or ""):
+            self.width.set_active_id(str(max(WIDTHS[band])))
+
+    def on_generate(self, *_):
+        alphabet = string.ascii_letters + string.digits
+        self.pw.set_text("".join(secrets.choice(alphabet) for _ in range(12)))
+        self.pw.set_visibility(True)
+
+    def on_save(self, *_):
+        pw = self.pw.get_text()
+        if pw and not 8 <= len(pw) <= 63:
+            self.notify("The password must be 8 to 63 characters.", error=True)
+            return
+        data = {
+            "ssid": self.ssid.get_text(), "band": self.band.get_active_id() or "5",
+            "channel": int(self.channel.get_active_id() or 0), "width": int(self.width.get_active_id() or 20),
+            "country": self.country.get_text().strip().upper(), "interface": self.adapter.get_active_id() or "",
+            "hidden": self.hidden.get_active(), "isolate": self.isolate.get_active(),
+            "max_clients": int(self.max_clients.get_value()), "boot": self.boot.get_active(),
+        }
+        if pw:
+            data["password"] = pw
+        running = self.status.get("state") == "active"
+
+        def saved():
+            self.password = pw or self.password
+        self.action(lambda: helper("set-config", root=True, data=json.dumps(data)),
+                    "Saved. The hotspot restarted with the new settings." if running else "Saved.", saved)
+
+    # ---- actions -----------------------------------------------------------------------
+
+    def action(self, work, ok_text, on_ok=None):
+        self.busy = True
+
+        def done(_res, err):
+            self.busy = False
+            if err:
+                self.notify(err, error=True)
+            else:
+                if on_ok:
+                    on_ok()
+                self.notify(ok_text)
+            self.poll()
+        in_thread(work, done)
+
+    def on_switch(self, *_):
+        on = self.switch.get_active()
+        self.set_state_text("Starting…" if on else "Stopping…", "")
+        self.action(lambda: helper("start" if on else "stop", root=True),
+                    "Hotspot is on." if on else "Hotspot is off.")
+
+    def on_device_action(self, _button, what):
+        model, it = self.device_view.get_selection().get_selected()
+        if not it:
+            self.notify("Select a device in the list first.", error=True)
+            return
+        mac, name = model[it][2], model[it][0]
+        done = {"kick": f"Disconnected {name}.", "block": f"Blocked {name}. It can't reconnect until you unblock it."}
+        self.action(lambda: helper(what, mac, root=True), done[what])
+
+    def on_page(self, *_):
+        if self.stack.get_visible_child_name() == "log":
+            self.load_log()
+
+    def load_log(self):
+        in_thread(lambda: helper("logs"), lambda text, err: self.log_view.get_buffer().set_text(err or text))
+
+    def on_share(self, *_):
+        cfg = self.status.get("config", {})
+        ssid, pw = cfg.get("ssid", ""), self.password or ""
+        dialog = Gtk.Dialog(title="Join the hotspot", transient_for=self, modal=True)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dialog.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(16)
+        if shutil.which("qrencode") and ssid and pw:
+            png = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-",
+                                  wifi_qr_text(ssid, pw, cfg.get("hidden"))], capture_output=True).stdout
+            loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+            loader.write(png)
+            loader.close()
+            area.add(Gtk.Image.new_from_pixbuf(loader.get_pixbuf()))
+            area.add(Gtk.Label(label="Scan with a phone camera to connect"))
+        info = Gtk.Label(selectable=True)
+        info.set_markup(f"Name: <b>{GLib.markup_escape_text(ssid)}</b>\nPassword: <b>{GLib.markup_escape_text(pw)}</b>")
+        area.add(info)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+
+class HotspotApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.xsobhi.HotspotManager")
+
+    def do_activate(self):
+        win = self.get_active_window() or HotspotWindow(self)
+        win.show_all()
+        win.present()
+
+
+if __name__ == "__main__":
+    HotspotApp().run()

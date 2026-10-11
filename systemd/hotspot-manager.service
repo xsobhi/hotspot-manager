@@ -1,0 +1,14 @@
+[Unit]
+Description=Wi-Fi hotspot (Hotspot Manager)
+After=network.target NetworkManager.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/hotspotctl _pre
+ExecStart=/usr/sbin/hostapd /run/hotspot-manager/hostapd.conf
+ExecStartPost=/usr/local/bin/hotspotctl _started
+ExecStopPost=/usr/local/bin/hotspotctl _post
+
+[Install]
+WantedBy=multi-user.target
