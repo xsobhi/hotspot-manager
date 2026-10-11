@@ -17,6 +17,8 @@ install -m 755 bin/hotspot-manager /usr/local/bin/hotspot-manager
 install -D -m 755 lib/dhcp-event /usr/local/lib/hotspot-manager/dhcp-event
 install -m 644 systemd/hotspot-manager.service /etc/systemd/system/hotspot-manager.service
 install -m 644 polkit/io.github.xsobhi.hotspot-manager.policy /usr/share/polkit-1/actions/
+install -D -m 644 icons/hotspot-manager.svg /usr/local/share/icons/hicolor/scalable/apps/hotspot-manager.svg
+install -D -m 644 icons/hotspot-manager-qr-symbolic.svg /usr/local/share/icons/hicolor/scalable/apps/hotspot-manager-qr-symbolic.svg
 install -D -m 644 desktop/hotspot-manager.desktop /usr/local/share/applications/hotspot-manager.desktop
 install -d -m 755 /etc/hotspot-manager
 systemctl daemon-reload

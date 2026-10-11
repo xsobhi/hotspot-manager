@@ -12,7 +12,7 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
 - **Speed limits**: per device, for **all devices** at once, and/or a **total** for the whole hotspot, separately
   for download and upload. Devices are remembered by MAC address, so a limit sticks when they reconnect
 - **Disconnect**, **Block / Unblock** and **Forget** for devices
-- **Share** button with the name, password and a QR code your phone camera can scan to join
+- **QR code** button: a code your phone camera can scan to join, plus the name and password
 - **Log** tab, so you can see why it failed to start
 
 ## Why not NetworkManager's built-in hotspot?
@@ -78,11 +78,17 @@ Open **Devices**, select one or more devices, then click **Set speed limit…** 
 - **No limit**: this device is never limited, even when all devices are
 - **Custom**: its own download/upload limit, with quick buttons for 1–50 Mbps
 
+Both the per-device and the all-devices limit can **allow short bursts**. For example, *2 Mbps, bursting to
+4 Mbps for 2 seconds* makes pages and small downloads load fast, then holds the device at 2 Mbps. The
+burst refills whenever the device uses less than its limit.
+
 **Limit all devices…** sets the per-device limit everyone gets by default, and an optional **whole-hotspot** cap
 that everyone shares.
 
 How it works: when a device gets an address, dnsmasq's lease hook records it and rebuilds the `tc` setup.
-Download is shaped with an HTB class per limited device on the hotspot adapter, matched by IP. Upload is
+Download is shaped with an HTB class per limited device on the hotspot adapter, matched by IP. A burst is a
+TBF token bucket under that class, with `rate` = limit, `peakrate` = burst speed, and a bucket of
+(burst − limit) × seconds. Upload is
 redirected to an IFB device (`hm-ifb0`) and shaped the same way. Each class uses fq_codel, so a limited
 device still gets low latency. Devices with a manually set (static) IP aren't matched, because limits
 follow DHCP leases.

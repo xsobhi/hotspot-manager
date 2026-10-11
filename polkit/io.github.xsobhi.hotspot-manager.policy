@@ -5,7 +5,7 @@
   <action id="io.github.xsobhi.hotspot-manager">
     <description>Control the Wi-Fi hotspot</description>
     <message>Authentication is required to control the Wi-Fi hotspot</message>
-    <icon_name>network-wireless-hotspot</icon_name>
+    <icon_name>hotspot-manager</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

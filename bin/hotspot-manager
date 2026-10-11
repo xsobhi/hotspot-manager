@@ -75,7 +75,13 @@ def fmt_limit(kbit):
 def fmt_pair(limit):
     if not limit["down"] and not limit["up"]:
         return "no limit"
-    return f"↓ {fmt_limit(limit['down'])}  ↑ {fmt_limit(limit['up'])}"
+    parts = []
+    for d, arrow in (("down", "↓"), ("up", "↑")):
+        text = f"{arrow} {fmt_limit(limit[d])}"
+        if limit.get(f"burst_{d}"):
+            text += f" (bursts to {fmt_limit(limit[f'burst_{d}'])} for {limit['burst_secs']}s)"
+        parts.append(text)
+    return "  ".join(parts)
 
 
 def ago(ts):
@@ -125,6 +131,59 @@ def spin_kbit(spin):
     return int(round(spin.get_value() * 1000))
 
 
+def speed_grid(rows):
+    """rows: (label, widget, unit) tuples laid out as a small form."""
+    grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+    for row, (label, widget, unit) in enumerate(rows):
+        grid.attach(Gtk.Label(label=label, xalign=1), 0, row, 1, 1)
+        grid.attach(widget, 1, row, 1, 1)
+        grid.attach(Gtk.Label(label=unit, xalign=0), 2, row, 1, 1)
+    return grid
+
+
+class LimitEditor(Gtk.Box):
+    """Download/upload limit, optionally with short bursts above it."""
+
+    def __init__(self, limit, burst=True):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=24)
+        self.down, self.up = speed_spin(limit["down"]), speed_spin(limit["up"])
+        self.add(speed_grid([("Download", self.down, "Mbps   (0 = no limit)"),
+                             ("Upload", self.up, "Mbps   (0 = no limit)")]))
+        self.burst = None
+        if not burst:
+            return
+        on = bool(limit.get("burst_down") or limit.get("burst_up"))
+        self.burst = Gtk.CheckButton(label="Allow short bursts above the limit", active=on,
+                                     tooltip_text="Pages and small downloads load fast, then the speed "
+                                                  "drops back to the limit. The burst refills while the "
+                                                  "device uses less than its limit.")
+        self.add(self.burst)
+        self.burst_down = speed_spin(limit.get("burst_down") or limit["down"] * 2)
+        self.burst_up = speed_spin(limit.get("burst_up") or limit["up"] * 2)
+        self.secs = Gtk.SpinButton.new_with_range(1, 60, 1)
+        self.secs.set_value(limit.get("burst_secs") or 2)
+        grid = speed_grid([("Download up to", self.burst_down, "Mbps"), ("Upload up to", self.burst_up, "Mbps"),
+                           ("For", self.secs, "seconds, then back to the limit")])
+        grid.set_margin_start(24)
+        grid.set_sensitive(on)
+        self.burst.connect("toggled", lambda b: grid.set_sensitive(b.get_active()))
+        self.add(grid)
+
+    def set_speed(self, mbps):
+        self.down.set_value(mbps)
+        self.up.set_value(mbps)
+        self.burst_down.set_value(mbps * 2)
+        self.burst_up.set_value(mbps * 2)
+
+    def get(self):
+        res = {"down": spin_kbit(self.down), "up": spin_kbit(self.up)}
+        if self.burst and self.burst.get_active():
+            res.update(burst_down=spin_kbit(self.burst_down) if res["down"] else 0,
+                       burst_up=spin_kbit(self.burst_up) if res["up"] else 0,
+                       burst_secs=int(self.secs.get_value()))
+        return res
+
+
 def wifi_qr_text(ssid, password, hidden):
     esc = lambda s: "".join("\\" + c if c in '\\;,":' else c for c in s)
     return f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(password)};{'H:true;' if hidden else ''};"
@@ -134,7 +193,7 @@ class HotspotWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Hotspot Manager")
         self.set_default_size(680, 560)
-        self.set_icon_name("network-wireless-hotspot")
+        self.set_icon_name("hotspot-manager")
         self.status = {}
         self.password = None
         self.settings_loaded = False
@@ -148,7 +207,11 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Turn the hotspot on or off")
         self.switch_handler = self.switch.connect("notify::active", self.on_switch)
         header.pack_end(self.switch)
-        share = Gtk.Button(label="Share", tooltip_text="Show the name, password and a QR code to join")
+        share = Gtk.Button(tooltip_text="Show a QR code (and the name and password) to join the hotspot")
+        share_box = Gtk.Box(spacing=6)
+        share_box.add(Gtk.Image.new_from_icon_name("hotspot-manager-qr", Gtk.IconSize.BUTTON))
+        share_box.add(Gtk.Label(label="QR code"))
+        share.add(share_box)
         share.connect("clicked", self.on_share)
         header.pack_start(share)
 
@@ -545,15 +608,6 @@ class HotspotWindow(Gtk.ApplicationWindow):
         area.set_border_width(16)
         return d, area
 
-    @staticmethod
-    def speed_grid(down_spin, up_spin):
-        grid = Gtk.Grid(column_spacing=8, row_spacing=6, margin_start=24)
-        for row, (label, spin) in enumerate((("Download", down_spin), ("Upload", up_spin))):
-            grid.attach(Gtk.Label(label=label, xalign=1), 0, row, 1, 1)
-            grid.attach(spin, 1, row, 1, 1)
-            grid.attach(Gtk.Label(label="Mbps   (0 = no limit)", xalign=0), 2, row, 1, 1)
-        return grid
-
     def on_set_limit(self):
         sel = self.selected()
         if not sel:
@@ -565,25 +619,25 @@ class HotspotWindow(Gtk.ApplicationWindow):
         r_default = Gtk.RadioButton(label=f"Same as all devices ({fmt_pair(default)})")
         r_none = Gtk.RadioButton.new_with_label_from_widget(r_default, "No limit")
         r_custom = Gtk.RadioButton.new_with_label_from_widget(r_default, "Custom limit:")
-        start = own or (default if default["down"] or default["up"] else {"down": 10000, "up": 5000})
-        down_spin, up_spin = speed_spin(start["down"]), speed_spin(start["up"])
-        grid = self.speed_grid(down_spin, up_spin)
+        has_own = own and (own["down"] or own["up"])
+        editor = LimitEditor(own if has_own else default if default["down"] or default["up"]
+                             else {"down": 10000, "up": 5000})
         presets = Gtk.Box(spacing=4, margin_start=24)
         presets.pack_start(Gtk.Label(label="Quick:"), False, False, 0)
         for mbps in (1, 2, 5, 10, 20, 50):
             b = Gtk.Button(label=f"{mbps} Mbps")
-            b.connect("clicked", lambda _b, v=mbps: (r_custom.set_active(True), down_spin.set_value(v), up_spin.set_value(v)))
+            b.connect("clicked", lambda _b, v=mbps: (r_custom.set_active(True), editor.set_speed(v)))
             presets.pack_start(b, False, False, 0)
-        for w in (r_default, r_none, r_custom, grid, presets):
+        for w in (r_default, r_none, r_custom, presets, editor):
             area.add(w)
-        r_custom.connect("toggled", lambda r: grid.set_sensitive(r.get_active()))
+        r_custom.connect("toggled", lambda r: editor.set_sensitive(r.get_active()))
         if own is None:
             r_default.set_active(True)
-        elif not own["down"] and not own["up"]:
+        elif not has_own:
             r_none.set_active(True)
         else:
             r_custom.set_active(True)
-        grid.set_sensitive(r_custom.get_active())
+        editor.set_sensitive(r_custom.get_active())
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
             if r_default.get_active():
@@ -591,7 +645,7 @@ class HotspotWindow(Gtk.ApplicationWindow):
             elif r_none.get_active():
                 limit = {"down": 0, "up": 0}
             else:
-                limit = {"down": spin_kbit(down_spin), "up": spin_kbit(up_spin)}
+                limit = editor.get()
             self.set_devices({"devices": {d["mac"]: {"limit": limit} for d in sel}},
                              f"Speed limit for {title}: {fmt_pair(limit or default)}.")
         dialog.destroy()
@@ -599,22 +653,20 @@ class HotspotWindow(Gtk.ApplicationWindow):
     def on_limit_all(self, *_):
         lim = self.status.get("limits") or {k: {"down": 0, "up": 0} for k in ("default", "total")}
         dialog, area = self.dialog("Limit all devices")
-        each = [speed_spin(lim["default"]["down"]), speed_spin(lim["default"]["up"])]
-        total = [speed_spin(lim["total"]["down"]), speed_spin(lim["total"]["up"])]
+        each, total = LimitEditor(lim["default"]), LimitEditor(lim["total"], burst=False)
         area.add(Gtk.Label(label="<b>Each device</b>\n<small>Every device gets at most this much, "
                                  "unless you gave it its own limit.</small>", use_markup=True, xalign=0))
-        area.add(self.speed_grid(*each))
+        area.add(each)
         area.add(Gtk.Label(label="<b>Whole hotspot</b>\n<small>All devices together share at most this much.</small>",
                            use_markup=True, xalign=0))
-        area.add(self.speed_grid(*total))
+        area.add(total)
         own = [mac for mac, d in self.device_info.items() if d["limit"] is not None]
         override = Gtk.CheckButton(label=f"Also replace the {len(own)} device-specific limit{'s' if len(own) != 1 else ''}")
         if own:
             area.add(override)
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
-            payload = {"default": {"down": spin_kbit(each[0]), "up": spin_kbit(each[1])},
-                       "total": {"down": spin_kbit(total[0]), "up": spin_kbit(total[1])}}
+            payload = {"default": each.get(), "total": total.get()}
             if override.get_active():
                 payload["devices"] = {mac: {"limit": None} for mac in own}
             self.set_devices(payload, f"Each device: {fmt_pair(payload['default'])}. "

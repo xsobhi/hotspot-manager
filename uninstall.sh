@@ -7,7 +7,9 @@ rm -f /usr/local/bin/hotspotctl /usr/local/bin/hotspot-manager \
       /usr/local/lib/hotspot-manager/dhcp-event \
       /etc/systemd/system/hotspot-manager.service \
       /usr/share/polkit-1/actions/io.github.xsobhi.hotspot-manager.policy \
-      /usr/local/share/applications/hotspot-manager.desktop
+      /usr/local/share/applications/hotspot-manager.desktop \
+      /usr/local/share/icons/hicolor/scalable/apps/hotspot-manager.svg \
+      /usr/local/share/icons/hicolor/scalable/apps/hotspot-manager-qr-symbolic.svg
 rmdir /usr/local/lib/hotspot-manager 2>/dev/null || true
 [ "$1" = --purge ] && rm -rf /etc/hotspot-manager
 systemctl daemon-reload

@@ -2,7 +2,7 @@
 Name=Hotspot Manager
 Comment=Turn the Wi-Fi hotspot on/off, change its password and manage connected devices
 Exec=/usr/local/bin/hotspot-manager
-Icon=network-wireless-hotspot
+Icon=hotspot-manager
 Terminal=false
 Type=Application
 Categories=Network;Settings;

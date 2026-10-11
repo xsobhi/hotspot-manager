@@ -113,7 +113,10 @@ def load_limits():
     res = {}
     for key in ("default", "total"):
         pair = raw.get(key) if isinstance(raw.get(key), dict) else {}
-        res[key] = {d: pair[d] if type(pair.get(d)) is int else 0 for d in ("down", "up")}
+        try:
+            res[key] = speed_pair(pair, key, burst=key == "default")
+        except Error:
+            res[key] = {"down": 0, "up": 0}
     return res
 
 
@@ -328,8 +331,9 @@ def shaping_down(iface):
 
 
 def htb(dev, total, items, match):
-    """Shape traffic leaving dev: an optional total cap, plus one capped class per (ip, kbit) item.
-    Everything else goes to the default class 1:ffff, limited only by the total."""
+    """Shape traffic leaving dev: an optional total cap, plus one capped class per
+    (ip, kbit, peak_kbit, burst_secs) item. Everything else goes to the default class 1:ffff,
+    limited only by the total."""
     top = total or MAX_KBIT
     tc = lambda *a: run(["tc", *a])
 
@@ -344,10 +348,18 @@ def htb(dev, total, items, match):
     htb_class("1:", "1:1", top)
     htb_class("1:1", "1:ffff", top)
     tc("qdisc", "add", "dev", dev, "parent", "1:ffff", "fq_codel")
-    for n, (ip, kbit) in enumerate(items, start=2):
+    for n, (ip, kbit, peak, secs) in enumerate(items, start=2):
         cid = f"1:{n:x}"
-        htb_class("1:1", cid, min(kbit, top))
-        tc("qdisc", "add", "dev", dev, "parent", cid, "fq_codel")
+        if peak > kbit:
+            # Burst: a token bucket filling at kbit, sized so the device can run at the peak for
+            # `secs` seconds before dropping back to kbit; it refills while the device uses less.
+            htb_class("1:1", cid, min(peak, top))
+            bucket = max(3200, (peak - kbit) * 125 * secs)
+            tc("qdisc", "add", "dev", dev, "parent", cid, "tbf", "rate", f"{kbit}kbit", "burst", str(bucket),
+               "peakrate", f"{peak}kbit", "mtu", "1600", "latency", "200ms")
+        else:
+            htb_class("1:1", cid, min(kbit, top))
+            tc("qdisc", "add", "dev", dev, "parent", cid, "fq_codel")
         tc("filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
            "flower", match, ip, "classid", cid)
 
@@ -369,9 +381,9 @@ def apply_shaping(changed=None):
     for mac, ip in sorted(active.items(), key=lambda kv: kv[1]):
         lim = device_limit(devices.get(mac, {}), limits)
         if lim["down"]:
-            down.append((ip, lim["down"]))
+            down.append((ip, lim["down"], lim.get("burst_down", 0), lim.get("burst_secs", 0)))
         if lim["up"]:
-            up.append((ip, lim["up"]))
+            up.append((ip, lim["up"], lim.get("burst_up", 0), lim.get("burst_secs", 0)))
     shaping_down(iface)
     # Download = traffic the laptop sends out of the hotspot adapter.
     if down or limits["total"]["down"]:
@@ -545,21 +557,35 @@ def cmd_set_config():
         cmd_restart()
 
 
-def speed_pair(value, what):
+def speed_pair(value, what, burst=True):
+    """Validate {down, up} (+ optional burst_down, burst_up = peak kbit/s, burst_secs)."""
     if not isinstance(value, dict):
         raise Error(f"{what} must be an object with down and up")
-    res = {}
-    for d in ("down", "up"):
-        v = value.get(d, 0)
-        if type(v) is not int or not 0 <= v <= MAX_KBIT:
-            raise Error(f"{what} {d} must be 0-{MAX_KBIT} kbit/s")
-        res[d] = v
+
+    def num(key, hi):
+        v = value.get(key, 0)
+        if type(v) is not int or not 0 <= v <= hi:
+            raise Error(f"{what} {key} must be a whole number from 0 to {hi}")
+        return v
+
+    res = {d: num(d, MAX_KBIT) for d in ("down", "up")}
+    if burst:
+        for d in ("down", "up"):
+            peak = num(f"burst_{d}", MAX_KBIT)
+            if peak and res[d] and peak <= res[d]:
+                raise Error(f"{what}: the {d}load burst speed must be higher than the limit")
+            res[f"burst_{d}"] = peak if res[d] else 0  # no limit = nothing to burst above
+        res["burst_secs"] = num("burst_secs", 60)
+        if (res["burst_down"] or res["burst_up"]) and not res["burst_secs"]:
+            raise Error(f"{what}: set how many seconds a burst may last (1-60)")
+        if not (res["burst_down"] or res["burst_up"]):
+            del res["burst_down"], res["burst_up"], res["burst_secs"]
     return res
 
 
 def cmd_set_devices():
     """Read JSON from stdin, speeds in kbit/s (0 = no limit):
-    {"default"?: {down, up}, "total"?: {down, up},
+    {"default"?: {down, up, burst_down?, burst_up?, burst_secs?}, "total"?: {down, up},
      "devices"?: {mac: null (forget it) | {"name"?: str, "limit"?: {down, up} | null (use default)}}}"""
     need_root()
     data = read_stdin_json()
@@ -570,7 +596,7 @@ def cmd_set_devices():
         limits, devices = load_limits(), load_devices()
         for key in ("default", "total"):
             if key in data:
-                limits[key] = speed_pair(data[key], key)
+                limits[key] = speed_pair(data[key], key, burst=key == "default")
         for mac, change in changes.items():
             mac = mac.lower()
             if not MAC_RE.match(mac):
