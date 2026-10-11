@@ -13,7 +13,7 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
   for download and upload. Devices are remembered by MAC address, so a limit sticks when they reconnect
 - **Network**: hotspot IP (the gateway devices get), subnet mask, DHCP range, lease time and DNS servers, plus a
   **fixed IP per device**. Clashes with your other networks are refused before anything changes
-- **Disconnect**, **Block / Unblock** and **Forget** for devices
+- **Click a device** to rename it, change its speed or IP, or disconnect, block or forget it
 - **QR code** button: a code your phone camera can scan to join, plus the name and password
 - **Log** tab, so you can see why it failed to start
 
@@ -74,21 +74,17 @@ Uninstall with `sudo ./uninstall.sh`, or `sudo ./uninstall.sh --purge` to also d
 
 ## Speed limits
 
-Open **Devices**, select one or more devices, then click **Set speed limit…** (or double-click a device). Choose:
+**Speed for everyone** (top of the Devices tab) gives every device the same speed, like MikroTik's PCQ queues:
+pick 1–50 Mbps or *No limit* and it applies straight away. Each device gets its own lane at that speed instead of
+sharing it, so a device that joins later is limited too. **Custom…** lets you set separate download/upload speeds,
+short bursts, and an optional cap for the whole hotspot.
 
-- **Same as all devices**: follow the all-devices limit (the default for every device)
-- **No limit**: this device is never limited, even when all devices are
-- **Custom**: its own download/upload limit, with quick buttons for 1–50 Mbps
+To give one device a different speed, **click it** and pick a speed: *Same as everyone*, *No limit*, a preset, or
+*Custom…*. Devices with their own speed keep it when you change everyone's. The line under the dropdown says
+how many there are, with a link to put them back on everyone's speed.
 
-Both the per-device and the all-devices limit can **allow short bursts**. For example, *2 Mbps, bursting to
-4 Mbps for 2 seconds* makes pages and small downloads load fast, then holds the device at 2 Mbps. The
-burst refills whenever the device uses less than its limit.
-
-**Each device gets** (the bar at the top of the Devices tab) is the fast way to give everyone the same speed,
-like MikroTik's PCQ queues. Type e.g. 2 ↓ / 1 ↑ Mbps and press **Apply**, or pick one from **Quick**. Each device
-gets its own lane at that speed instead of sharing it, so a device that joins later is limited too.
-Devices you gave their own limit keep it, and one click (*make them follow this too*) puts them back on the shared speed.
-**Total & bursts…** adds bursts to it, plus an optional **whole-hotspot** cap that everyone shares.
+**Bursts**: for example, *2 Mbps, bursting to 4 Mbps for 2 seconds* makes pages and small downloads load fast,
+then holds the device at 2 Mbps. The burst refills whenever the device uses less than its limit.
 
 How it works: when a device gets an address, dnsmasq's lease hook records it and rebuilds the `tc` setup.
 Download is shaped with an HTB class per limited device on the hotspot adapter, matched by IP. A burst is a
@@ -109,7 +105,7 @@ echo '{"devices": {"aa:bb:cc:dd:ee:ff": {"name": "Living room TV", "limit": {"do
 
 ## Network settings
 
-Under **Settings → Network**:
+Under **Settings → Advanced → Network**:
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -119,7 +115,7 @@ Under **Settings → Network**:
 | Lease time | 12 hours | |
 | DNS servers | automatic | Empty = devices ask the hotspot, which uses the laptop's DNS. Or up to 3, e.g. `1.1.1.1, 8.8.8.8` |
 
-For a **fixed IP**, select a device and click **Edit…**. The address can be inside or outside the DHCP range.
+For a **fixed IP**, click the device and open **Fixed IP address**. The address can be inside or outside the DHCP range.
 If the device is online, it gets reconnected so it picks up the new address. Fixed IPs are keyed by MAC, so a
 phone using a *random* ("private") MAC per network keeps it only as long as it keeps that MAC.
 
@@ -137,7 +133,7 @@ The Wi-Fi password is stored in `/etc/hotspot-manager/password` (root-only, mode
 
 - **Only non-DFS channels are offered** (5 GHz: 36–48 and 149–165). DFS channels need radar detection,
   which USB adapters generally can't do in AP mode. Channels 149–165 aren't allowed for hotspots in some
-  countries (e.g. most of Europe). If one fails to start, the Log tab says why. Use 36–48.
+  countries (e.g. most of Europe). If one fails to start, **Settings → Advanced → View log** says why. Use 36–48.
 - **Set your country** in Settings. It decides which channels and transmit power are legal, and with the
   default world setting many adapters refuse to host on 5 GHz.
 - **RTL8812BU / RTL8822BU (`rtw88_8822bu`) on 5 GHz:** with the driver's beamforming support on,

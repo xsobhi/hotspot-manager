@@ -5,6 +5,6 @@ Exec=/usr/local/bin/hotspot-manager
 Icon=hotspot-manager
 Terminal=false
 Type=Application
-Categories=Network;Settings;
+Categories=Network;
 Keywords=hotspot;wifi;access point;hostapd;tethering;
 StartupWMClass=hotspot-manager

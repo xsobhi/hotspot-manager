@@ -22,5 +22,17 @@ install -D -m 644 icons/hotspot-manager-qr-symbolic.svg /usr/local/share/icons/h
 install -D -m 644 desktop/hotspot-manager.desktop /usr/local/share/applications/hotspot-manager.desktop
 install -d -m 755 /etc/hotspot-manager
 systemctl daemon-reload
+update-desktop-database -q /usr/local/share/applications 2>/dev/null || true
+
+# Desktop shortcut for the user who ran the installer (sudo or pkexec).
+user=${SUDO_USER:-}
+[ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ] && user=$(id -nu "$PKEXEC_UID")
+if [ -n "$user" ] && [ "$user" != root ]; then
+    desk=$(runuser -u "$user" -- xdg-user-dir DESKTOP 2>/dev/null || echo "/home/$user/Desktop")
+    if [ -d "$desk" ]; then
+        install -m 755 -o "$user" -g "$(id -gn "$user")" desktop/hotspot-manager.desktop "$desk/hotspot-manager.desktop"
+        runuser -u "$user" -- gio set "$desk/hotspot-manager.desktop" metadata::trusted true 2>/dev/null || true
+    fi
+fi
 
 echo "Installed. Open \"Hotspot Manager\" from the menu, set a password in Settings and flip the switch."

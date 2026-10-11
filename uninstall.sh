@@ -12,5 +12,8 @@ rm -f /usr/local/bin/hotspotctl /usr/local/bin/hotspot-manager \
       /usr/local/share/icons/hicolor/scalable/apps/hotspot-manager-qr-symbolic.svg
 rmdir /usr/local/lib/hotspot-manager 2>/dev/null || true
 [ "$1" = --purge ] && rm -rf /etc/hotspot-manager
+user=${SUDO_USER:-}
+[ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ] && user=$(id -nu "$PKEXEC_UID")
+[ -n "$user" ] && rm -f "$(runuser -u "$user" -- xdg-user-dir DESKTOP 2>/dev/null || echo "/home/$user/Desktop")/hotspot-manager.desktop"
 systemctl daemon-reload
 echo "Removed."
