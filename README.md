@@ -84,8 +84,11 @@ Both the per-device and the all-devices limit can **allow short bursts**. For ex
 4 Mbps for 2 seconds* makes pages and small downloads load fast, then holds the device at 2 Mbps. The
 burst refills whenever the device uses less than its limit.
 
-**Limit all devices…** sets the per-device limit everyone gets by default, and an optional **whole-hotspot** cap
-that everyone shares.
+**Each device gets** (the bar at the top of the Devices tab) is the fast way to give everyone the same speed,
+like MikroTik's PCQ queues. Type e.g. 2 ↓ / 1 ↑ Mbps and press **Apply**, or pick one from **Quick**. Each device
+gets its own lane at that speed instead of sharing it, so a device that joins later is limited too.
+Devices you gave their own limit keep it, and one click (*make them follow this too*) puts them back on the shared speed.
+**Total & bursts…** adds bursts to it, plus an optional **whole-hotspot** cap that everyone shares.
 
 How it works: when a device gets an address, dnsmasq's lease hook records it and rebuilds the `tc` setup.
 Download is shaped with an HTB class per limited device on the hotspot adapter, matched by IP. A burst is a
