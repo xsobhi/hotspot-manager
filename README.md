@@ -11,6 +11,8 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
   give them names you'll recognise
 - **Speed limits**: per device, for **all devices** at once, and/or a **total** for the whole hotspot, separately
   for download and upload. Devices are remembered by MAC address, so a limit sticks when they reconnect
+- **Network**: hotspot IP (the gateway devices get), subnet mask, DHCP range, lease time and DNS servers, plus a
+  **fixed IP per device**. Clashes with your other networks are refused before anything changes
 - **Disconnect**, **Block / Unblock** and **Forget** for devices
 - **QR code** button: a code your phone camera can scan to join, plus the name and password
 - **Log** tab, so you can see why it failed to start
@@ -27,7 +29,7 @@ It's a thin layer over standard tools:
 | Part | Does |
 |---|---|
 | `hostapd` | runs the access point (WPA2, 802.11n/ac) |
-| `dnsmasq` | gives devices an address in `10.42.0.0/24` and forwards DNS |
+| `dnsmasq` | gives devices addresses (default `10.42.0.0/24`), fixed IPs, and forwards DNS |
 | `iptables` | NAT to whatever connection the laptop is using, plus rules that work with ufw on |
 | `tc` (HTB + fq_codel, IFB for upload) | speed limits |
 | `hotspotctl` | small root helper that ties it together, run as the `hotspot-manager` systemd service |
@@ -102,12 +104,28 @@ echo '{"devices": {"aa:bb:cc:dd:ee:ff": {"name": "Living room TV", "limit": {"do
   | sudo hotspotctl set-devices
 ```
 
+## Network settings
+
+Under **Settings → Network**:
+
+| Setting | Default | Notes |
+|---|---|---|
+| Hotspot IP (gateway) | `10.42.0.1` | Must be private (10.x, 172.16–31.x, 192.168.x). Changing it moves the DHCP range along with it |
+| Subnet mask | `255.255.255.0` (/24) | /16 to /29 |
+| DHCP range | `10.42.0.10` – `10.42.0.254` | Inside the subnet, with the hotspot IP outside it |
+| Lease time | 12 hours | |
+| DNS servers | automatic | Empty = devices ask the hotspot, which uses the laptop's DNS. Or up to 3, e.g. `1.1.1.1, 8.8.8.8` |
+
+For a **fixed IP**, select a device and click **Edit…**. The address can be inside or outside the DHCP range.
+If the device is online, it gets reconnected so it picks up the new address. Fixed IPs are keyed by MAC, so a
+phone using a *random* ("private") MAC per network keeps it only as long as it keeps that MAC.
+
 ## Permissions
 
 The polkit rule lets the **logged-in local user** run `hotspotctl` as root without a password. That's how the
 app can save settings and flip the switch without prompting, like NetworkManager's own hotspot. Remote and
 inactive sessions still need an admin password. `hotspotctl` validates every input: the SSID,
-password, channel, country code, adapter name, MAC addresses, device names and speed values. If you want a password prompt every time,
+password, channel, country code, adapter name, MAC addresses, device names, speed values and IP settings. If you want a password prompt every time,
 change `allow_active` to `auth_admin_keep` in `/usr/share/polkit-1/actions/io.github.xsobhi.hotspot-manager.policy`.
 
 The Wi-Fi password is stored in `/etc/hotspot-manager/password` (root-only, mode 600).

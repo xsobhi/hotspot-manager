@@ -7,6 +7,7 @@ The GUI calls it through pkexec; `status`, `interfaces` and `logs` also work as 
 """
 import contextlib
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -32,14 +33,15 @@ LEASES = os.path.join(RUN, "dnsmasq.leases")
 DNSMASQ_PID = os.path.join(RUN, "dnsmasq.pid")
 STATE = os.path.join(RUN, "state.json")
 SERVICE = "hotspot-manager.service"
-SUBNET = "10.42.0"
-GATEWAY = SUBNET + ".1"
 
 # Non-DFS channels only: DFS needs radar detection, which most USB adapters can't do as an AP.
 CHANNELS = {"5": [36, 40, 44, 48, 149, 153, 157, 161, 165], "2.4": list(range(1, 14))}
 WIDTHS = {"5": [20, 40, 80], "2.4": [20, 40]}
 DEFAULTS = {"interface": "", "ssid": "Hotspot", "band": "5", "channel": 36, "width": 80,
-            "country": "", "hidden": False, "isolate": False, "max_clients": 0}
+            "country": "", "hidden": False, "isolate": False, "max_clients": 0,
+            # Addressing handed to devices. dns = [] means "ask the hotspot", which forwards to the laptop's DNS.
+            "gateway": "10.42.0.1", "prefix": 24, "dhcp_start": "10.42.0.10", "dhcp_end": "10.42.0.254",
+            "lease_hours": 12, "dns": []}
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 FIREWALL = [("filter", "INPUT", "HM_INPUT"), ("filter", "FORWARD", "HM_FORWARD"),
@@ -271,6 +273,20 @@ def hostapd_conf(cfg, iface, password):
 
 # ---- firewall / DHCP --------------------------------------------------------------------
 
+def network(cfg):
+    return ipaddress.IPv4Interface(f"{cfg['gateway']}/{cfg['prefix']}").network
+
+
+def other_networks(iface=None):
+    """IPv4 networks on the laptop's other interfaces (a hotspot subnet overlapping them breaks routing)."""
+    try:
+        addrs = json.loads(quiet(["ip", "-j", "-4", "addr", "show"]).stdout or "[]")
+    except ValueError:
+        return []
+    return [(a["ifname"], ipaddress.IPv4Interface(f"{i['local']}/{i['prefixlen']}").network)
+            for a in addrs if a.get("ifname") not in (iface, "lo") for i in a.get("addr_info", [])]
+
+
 def firewall_down():
     for table, parent, chain in FIREWALL:
         while quiet(["iptables", "-t", table, "-D", parent, "-j", chain]).returncode == 0:
@@ -279,9 +295,9 @@ def firewall_down():
         quiet(["iptables", "-t", table, "-X", chain])
 
 
-def firewall_up(iface, isolate):
+def firewall_up(iface, isolate, net):
     firewall_down()
-    net = SUBNET + ".0/24"
+    net = str(net)
     rules = {
         "HM_INPUT": [["-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
                      ["-i", iface, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
@@ -299,22 +315,31 @@ def firewall_up(iface, isolate):
         run(["iptables", "-t", table, "-I", parent, "1", "-j", chain])
 
 
-def stop_dnsmasq():
+def stop_dnsmasq(keep_leases=False):
     pid = read(DNSMASQ_PID).strip()
     if pid.isdigit() and read(f"/proc/{pid}/comm").strip() == "dnsmasq":
         os.kill(int(pid), signal.SIGTERM)
-    for f in (DNSMASQ_PID, LEASES):
+        for _ in range(20):  # wait so a restart can bind the same address
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.1)
+    for f in [DNSMASQ_PID] + ([] if keep_leases else [LEASES]):
         if os.path.exists(f):
             os.remove(f)
 
 
-def start_dnsmasq(iface):
-    stop_dnsmasq()
+def start_dnsmasq(iface, keep_leases=False):
+    cfg = load_config()
+    net, gw = network(cfg), cfg["gateway"]
+    stop_dnsmasq(keep_leases)
+    fixed = [f"--dhcp-host={mac},{d['static_ip']}" for mac, d in load_devices().items()
+             if d.get("static_ip") and ipaddress.IPv4Address(d["static_ip"]) in net]  # skip ones left from an old subnet
     run(["dnsmasq", "--conf-file=/dev/null", "--no-hosts", f"--interface={iface}", "--bind-dynamic",
-         f"--listen-address={GATEWAY}", f"--dhcp-range={SUBNET}.10,{SUBNET}.254,255.255.255.0,12h",
-         f"--dhcp-option=option:router,{GATEWAY}", f"--dhcp-option=option:dns-server,{GATEWAY}",
+         f"--listen-address={gw}",
+         f"--dhcp-range={cfg['dhcp_start']},{cfg['dhcp_end']},{net.netmask},{cfg['lease_hours']}h",
+         f"--dhcp-option=option:router,{gw}", f"--dhcp-option=option:dns-server,{','.join(cfg['dns']) or gw}",
          "--dhcp-authoritative", f"--dhcp-leasefile={LEASES}", f"--pid-file={DNSMASQ_PID}",
-         f"--dhcp-script={DHCP_HOOK}"])
+         f"--dhcp-script={DHCP_HOOK}"] + fixed)
 
 
 def set_ip_forward(value):
@@ -444,10 +469,13 @@ def pre_start():
     quiet(["iw", "reg", "set", cfg["country"]])
     time.sleep(1)  # let NetworkManager/wpa_supplicant let go of the adapter
     run(["ip", "addr", "flush", "dev", iface])
-    run(["ip", "addr", "add", GATEWAY + "/24", "dev", iface])
+    clash = [name for name, net in other_networks(iface) if net.overlaps(network(cfg))]
+    if clash:
+        raise Error(f"the hotspot network {network(cfg)} overlaps {clash[0]}'s network; pick another hotspot IP")
+    run(["ip", "addr", "add", f"{cfg['gateway']}/{cfg['prefix']}", "dev", iface])
     run(["ip", "link", "set", iface, "up"])
     set_ip_forward("1")
-    firewall_up(iface, cfg["isolate"])
+    firewall_up(iface, cfg["isolate"], network(cfg))
 
 
 def post_start():
@@ -532,6 +560,43 @@ def validate(cfg):
             raise Error(f"{key} must be true or false")
     if type(cfg["max_clients"]) is not int or not 0 <= cfg["max_clients"] <= 255:
         raise Error("max_clients must be 0-255")
+    validate_network(cfg)
+
+
+def ip_arg(value, what):
+    try:
+        return ipaddress.IPv4Address(value if isinstance(value, str) else "")
+    except ValueError:
+        raise Error(f"{what} must be an IPv4 address like 192.168.50.1")
+
+
+def validate_network(cfg):
+    if type(cfg["prefix"]) is not int or not 16 <= cfg["prefix"] <= 29:
+        raise Error("subnet mask must be between /16 (255.255.0.0) and /29 (255.255.255.248)")
+    gw = ip_arg(cfg["gateway"], "hotspot IP")
+    if not gw.is_private:
+        raise Error("hotspot IP must be a private address (10.x, 172.16-31.x or 192.168.x)")
+    net = network(cfg)
+    if gw in (net.network_address, net.broadcast_address):
+        raise Error(f"{gw} is the network/broadcast address of {net}; use e.g. {net.network_address + 1}")
+    start, end = ip_arg(cfg["dhcp_start"], "DHCP range start"), ip_arg(cfg["dhcp_end"], "DHCP range end")
+    hosts = (net.network_address + 1, net.broadcast_address - 1)
+    if not (start in net and end in net):
+        raise Error(f"the DHCP range must be inside {net} ({hosts[0]} - {hosts[1]})")
+    if start > end:
+        raise Error("the DHCP range start must not be after its end")
+    if start in (net.network_address, net.broadcast_address) or end in (net.network_address, net.broadcast_address):
+        raise Error(f"the DHCP range must stay within {hosts[0]} - {hosts[1]}")
+    if start <= gw <= end:
+        raise Error(f"the hotspot IP {gw} must be outside the DHCP range")
+    if type(cfg["lease_hours"]) is not int or not 1 <= cfg["lease_hours"] <= 720:
+        raise Error("lease time must be 1-720 hours")
+    if not isinstance(cfg["dns"], list) or len(cfg["dns"]) > 3:
+        raise Error("give up to 3 DNS servers")
+    cfg["dns"] = [str(ip_arg(d, "DNS server")) for d in cfg["dns"]]
+    clash = [name for name, other in other_networks(load_state().get("interface") or cfg["interface"]) if other.overlaps(net)]
+    if clash:
+        raise Error(f"{net} overlaps the network on {clash[0]}; pick a different hotspot IP")
 
 
 def cmd_set_config():
@@ -583,15 +648,30 @@ def speed_pair(value, what, burst=True):
     return res
 
 
+def static_ip(value, mac, devices):
+    cfg = load_config()
+    ip, net = ip_arg(value, "fixed IP"), network(cfg)
+    if ip not in net or ip in (net.network_address, net.broadcast_address):
+        raise Error(f"the fixed IP must be inside the hotspot network {net}")
+    if str(ip) == cfg["gateway"]:
+        raise Error(f"{ip} is the hotspot's own address")
+    taken = [m for m, d in devices.items() if m != mac and d.get("static_ip") == str(ip)]
+    if taken:
+        raise Error(f"{ip} is already reserved for {devices[taken[0]].get('name') or taken[0]}")
+    return str(ip)
+
+
 def cmd_set_devices():
     """Read JSON from stdin, speeds in kbit/s (0 = no limit):
     {"default"?: {down, up, burst_down?, burst_up?, burst_secs?}, "total"?: {down, up},
-     "devices"?: {mac: null (forget it) | {"name"?: str, "limit"?: {down, up} | null (use default)}}}"""
+     "devices"?: {mac: null (forget it) | {"name"?: str, "limit"?: {down, up} | null (use default),
+                                             "static_ip"?: "10.42.0.50" | "" (automatic)}}}"""
     need_root()
     data = read_stdin_json()
     changes = data.get("devices") or {}
     if not isinstance(changes, dict):
         raise Error("devices must be an object keyed by MAC address")
+    moved = []  # devices whose fixed IP changed
     with locked():
         limits, devices = load_limits(), load_devices()
         for key in ("default", "total"):
@@ -620,9 +700,20 @@ def cmd_set_devices():
                     dev.pop("limit", None)
                 else:
                     dev["limit"] = speed_pair(change["limit"], "limit")
+            if "static_ip" in change and change["static_ip"] != dev.get("static_ip", ""):
+                if change["static_ip"]:
+                    dev["static_ip"] = static_ip(change["static_ip"], mac, devices)
+                else:
+                    dev.pop("static_ip", None)
+                moved.append(mac)
         write(LIMITS, json.dumps(limits, indent=1) + "\n")
         write(DEVICES, json.dumps(devices, indent=1) + "\n")
         if service_state() == "active":
+            if moved:
+                # dnsmasq reads fixed addresses at start. Reconnect the device so it picks up its new IP.
+                start_dnsmasq(load_state()["interface"], keep_leases=True)
+                for mac in moved:
+                    hostapd_cli("deauthenticate", mac)
             apply_shaping()
 
 
@@ -689,7 +780,8 @@ def cmd_status():
             "mac": mac, "name": dev.get("name", ""), "hostname": ls.get("hostname") or dev.get("hostname", ""),
             "ip": ls.get("ip") or dev.get("ip", ""), "online": live is not None, "blocked": mac in blocked_macs,
             "last_seen": now if live else dev.get("last_seen", 0),
-            "limit": dev.get("limit"), "effective": device_limit(dev, limits), **(live or {}),
+            "limit": dev.get("limit"), "effective": device_limit(dev, limits), "static_ip": dev.get("static_ip", ""),
+            **(live or {}),
         })
     print(json.dumps({
         "state": state,

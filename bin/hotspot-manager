@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Hotspot Manager - control a hostapd Wi-Fi hotspot from the desktop."""
+import ipaddress
 import json
 import secrets
 import shutil
@@ -18,6 +19,7 @@ HELPER = "/usr/local/bin/hotspotctl"
 CHANNELS = {"5": [36, 40, 44, 48, 149, 153, 157, 161, 165], "2.4": list(range(1, 14))}
 WIDTHS = {"5": [20, 40, 80], "2.4": [20, 40]}
 OUI_FILE = "/usr/share/ieee-data/oui.txt"
+LEASE_TIMES = [(1, "1 hour"), (6, "6 hours"), (12, "12 hours"), (24, "1 day"), (72, "3 days"), (168, "1 week")]
 # Device list columns
 (C_MAC, C_STATUS, C_NAME, C_SORT_NAME, C_IP, C_NOW, C_NOW_SORT, C_LIMIT, C_SIGNAL, C_SIGNAL_SORT,
  C_DATA, C_DATA_SORT, C_SEEN, C_SEEN_SORT, C_SEARCH, C_ONLINE, C_BLOCKED) = range(17)
@@ -288,7 +290,7 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.device_buttons = {}
         for label, handler, tip in (
                 ("Set speed limit…", lambda *_: self.on_set_limit(), "Limit download/upload speed (or double-click a device)"),
-                ("Rename…", self.on_rename, "Give the device a name you'll recognise"),
+                ("Edit…", self.on_edit, "Give the device a name and, if you like, a fixed IP address"),
                 ("Disconnect", lambda *_: self.on_device_action("kick"), "Kick the device off (it can reconnect)"),
                 ("Block", lambda *_: self.on_device_action("block"), "Kick the device off and stop it from reconnecting"),
                 ("Forget", self.on_forget, "Remove an offline device from the list, with its name and limit")):
@@ -338,6 +340,33 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.isolate = Gtk.CheckButton(label="Stop connected devices from seeing each other")
         self.boot = Gtk.CheckButton(label="Turn on automatically at startup")
         rows += [("", self.hidden), ("", self.isolate), ("", self.boot)]
+
+        rows.append(("", Gtk.Label(label="<b>Network</b>\n<small>Devices get an address from the DHCP range, with the "
+                                         "hotspot IP as their gateway. Saving restarts the hotspot.</small>",
+                                   use_markup=True, xalign=0, margin_top=12)))
+        self.gateway = Gtk.Entry(placeholder_text="10.42.0.1", tooltip_text="The laptop's address on the hotspot. "
+                                 "Devices use it as their gateway (router).")
+        self.gateway.connect("changed", self.on_network_changed)
+        rows.append(("Hotspot IP (gateway)", self.gateway))
+        self.prefix = Gtk.ComboBoxText()
+        for prefix in range(16, 30):
+            self.prefix.append(str(prefix), f"{ipaddress.IPv4Network(f'0.0.0.0/{prefix}').netmask}   (/{prefix})")
+        self.prefix.connect("changed", self.on_network_changed)
+        rows.append(("Subnet mask", self.prefix))
+        self.dhcp_start, self.dhcp_end = Gtk.Entry(width_chars=15), Gtk.Entry(width_chars=15)
+        range_box = Gtk.Box(spacing=6)
+        range_box.pack_start(self.dhcp_start, True, True, 0)
+        range_box.pack_start(Gtk.Label(label="to"), False, False, 0)
+        range_box.pack_start(self.dhcp_end, True, True, 0)
+        rows.append(("DHCP range", range_box))
+        self.lease = Gtk.ComboBoxText(tooltip_text="How long a device keeps its address before renewing it")
+        for hours, text in LEASE_TIMES:
+            self.lease.append(str(hours), text)
+        rows.append(("Lease time", self.lease))
+        self.dns = Gtk.Entry(placeholder_text="Automatic (this laptop's DNS)",
+                             tooltip_text="Up to 3 DNS servers given to devices, separated by commas, "
+                                          "e.g. 1.1.1.1, 8.8.8.8. Leave empty to use the laptop's.")
+        rows.append(("DNS servers", self.dns))
 
         for n, (label, widget) in enumerate(rows):
             grid.attach(Gtk.Label(label=label, xalign=1), 0, n, 1, 1)
@@ -435,19 +464,23 @@ class HotspotWindow(Gtk.ApplicationWindow):
                 status = "<span foreground='#2ec27e'>●</span>"
             else:
                 status = "<span foreground='#888888'>○</span>"
+            ip_text = esc(d["ip"])
+            if d["static_ip"]:
+                ip_text = (f"{ip_text}  <small>(fixed)</small>" if d["ip"] == d["static_ip"]
+                           else f"{ip_text}\n<small>fixed: {d['static_ip']} after reconnect</small>")
             eff, own = d["effective"], d["limit"] is not None
             limit = fmt_pair(eff)
             if eff["down"] or eff["up"]:
                 limit = f"<b>{limit}</b>" if own else f"{limit}  <small>(all devices)</small>"
             values = [
                 mac, status, f"<b>{esc(name)}</b>\n<small>{esc('  ·  '.join(details))}</small>", name.lower(),
-                d["ip"], f"↓ {fmt_rate(down)}\n↑ {fmt_rate(up)}" if online else "", down + up, limit,
+                ip_text, f"↓ {fmt_rate(down)}\n↑ {fmt_rate(up)}" if online else "", down + up, limit,
                 f"{d['signal']} dBm" if online and d.get("signal") else "", int(d.get("signal") or -999) if online else -999,
                 f"↓ {human_bytes(d['down_bytes'])}\n↑ {human_bytes(d['up_bytes'])}" if online else "",
                 float(d["down_bytes"] + d["up_bytes"]) if online else 0.0,
                 human_time(d["connected"]) if online else ago(d["last_seen"]),
                 -d["connected"] if online else d["last_seen"] - int(time.time()),
-                " ".join([name, d["hostname"], d["ip"], mac, maker]).lower(), online, d["blocked"],
+                " ".join([name, d["hostname"], d["ip"], d["static_ip"], mac, maker]).lower(), online, d["blocked"],
             ]
             if mac in rows:
                 self.devices.set_row(rows.pop(mac), values)
@@ -472,7 +505,7 @@ class HotspotWindow(Gtk.ApplicationWindow):
         sel = self.selected()
         b = self.device_buttons
         b["Set speed limit…"].set_sensitive(bool(sel))
-        b["Rename…"].set_sensitive(len(sel) == 1)
+        b["Edit…"].set_sensitive(len(sel) == 1)
         b["Disconnect"].set_sensitive(any(d["online"] for d in sel))
         b["Block"].set_sensitive(bool(sel))
         b["Block"].set_label("Unblock" if sel and all(d["blocked"] for d in sel) else "Block")
@@ -518,6 +551,34 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.hidden.set_active(cfg["hidden"])
         self.isolate.set_active(cfg["isolate"])
         self.boot.set_active(boot)
+        self.gateway.set_text(cfg["gateway"])
+        self.prefix.set_active_id(str(cfg["prefix"]))
+        self.dhcp_start.set_text(cfg["dhcp_start"])
+        self.dhcp_end.set_text(cfg["dhcp_end"])
+        if not self.lease.set_active_id(str(cfg["lease_hours"])):
+            self.lease.append(str(cfg["lease_hours"]), f"{cfg['lease_hours']} hours")
+            self.lease.set_active_id(str(cfg["lease_hours"]))
+        self.dns.set_text(", ".join(cfg["dns"]))
+
+    def on_network_changed(self, *_):
+        """When the hotspot IP or mask moves to another subnet, move the DHCP range along with it."""
+        try:
+            gw = ipaddress.IPv4Address(self.gateway.get_text().strip())
+            net = ipaddress.IPv4Interface(f"{gw}/{self.prefix.get_active_id()}").network
+        except ValueError:
+            return
+        try:
+            if all(ipaddress.IPv4Address(e.get_text().strip()) in net for e in (self.dhcp_start, self.dhcp_end)):
+                return
+        except ValueError:
+            pass
+        first, last = net.network_address + 1, net.broadcast_address - 1
+        if gw < last:
+            start, end = min(gw + (9 if net.num_addresses > 64 else 1), last), last
+        else:
+            start, end = first, gw - 1
+        self.dhcp_start.set_text(str(start))
+        self.dhcp_end.set_text(str(end))
 
     def on_band(self, *_):
         band = self.band.get_active_id() or "5"
@@ -549,6 +610,10 @@ class HotspotWindow(Gtk.ApplicationWindow):
             "country": self.country.get_text().strip().upper(), "interface": self.adapter.get_active_id() or "",
             "hidden": self.hidden.get_active(), "isolate": self.isolate.get_active(),
             "max_clients": int(self.max_clients.get_value()), "boot": self.boot.get_active(),
+            "gateway": self.gateway.get_text().strip(), "prefix": int(self.prefix.get_active_id() or 24),
+            "dhcp_start": self.dhcp_start.get_text().strip(), "dhcp_end": self.dhcp_end.get_text().strip(),
+            "lease_hours": int(self.lease.get_active_id() or 12),
+            "dns": self.dns.get_text().replace(",", " ").replace(";", " ").split(),
         }
         if pw:
             data["password"] = pw
@@ -673,21 +738,32 @@ class HotspotWindow(Gtk.ApplicationWindow):
                                       f"Whole hotspot: {fmt_pair(payload['total'])}.")
         dialog.destroy()
 
-    def on_rename(self, *_):
+    def on_edit(self, *_):
         sel = self.selected()
         if len(sel) != 1:
             return
         d = sel[0]
-        dialog, area = self.dialog("Rename device", "Save")
+        dialog, area = self.dialog(f"Edit {device_name(d)}", "Save")
         area.add(Gtk.Label(label=f"MAC {d['mac']}" + (f"  ·  calls itself “{d['hostname']}”" if d["hostname"] else ""), xalign=0))
-        entry = Gtk.Entry(text=d["name"], max_length=40, activates_default=True,
-                          placeholder_text=d["hostname"] or "e.g. Ahmed's phone")
-        area.add(entry)
+        name = Gtk.Entry(text=d["name"], max_length=40, activates_default=True,
+                         placeholder_text=d["hostname"] or "e.g. Ahmed's phone")
+        auto = Gtk.RadioButton(label="Get an IP address automatically")
+        fixed = Gtk.RadioButton.new_with_label_from_widget(auto, "Always give it this IP address:")
+        ip = Gtk.Entry(text=d["static_ip"] or d["ip"], activates_default=True, margin_start=24,
+                       placeholder_text=self.status["config"]["dhcp_start"])
+        fixed.set_active(bool(d["static_ip"]))
+        ip.set_sensitive(fixed.get_active())
+        fixed.connect("toggled", lambda r: ip.set_sensitive(r.get_active()))
+        form = speed_grid([("Name", name, "")])
+        for w in (form, auto, fixed, ip):
+            area.add(w)
+        if d["online"]:
+            area.add(Gtk.Label(label="<small>If the address changes, the device reconnects to pick it up.</small>",
+                               use_markup=True, xalign=0))
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
-            name = entry.get_text().strip()
-            self.set_devices({"devices": {d["mac"]: {"name": name}}},
-                             f"Renamed to {name}." if name else "Name cleared.")
+            change = {"name": name.get_text().strip(), "static_ip": ip.get_text().strip() if fixed.get_active() else ""}
+            self.set_devices({"devices": {d["mac"]: change}}, f"Saved {change['name'] or device_name(d)}.")
         dialog.destroy()
 
     def on_forget(self, *_):
