@@ -6,6 +6,7 @@ import shutil
 import string
 import subprocess
 import threading
+import time
 
 import gi
 
@@ -16,6 +17,10 @@ from gi.repository import GdkPixbuf, GLib, Gtk  # noqa: E402
 HELPER = "/usr/local/bin/hotspotctl"
 CHANNELS = {"5": [36, 40, 44, 48, 149, 153, 157, 161, 165], "2.4": list(range(1, 14))}
 WIDTHS = {"5": [20, 40, 80], "2.4": [20, 40]}
+OUI_FILE = "/usr/share/ieee-data/oui.txt"
+# Device list columns
+(C_MAC, C_STATUS, C_NAME, C_SORT_NAME, C_IP, C_NOW, C_NOW_SORT, C_LIMIT, C_SIGNAL, C_SIGNAL_SORT,
+ C_DATA, C_DATA_SORT, C_SEEN, C_SEEN_SORT, C_SEARCH, C_ONLINE, C_BLOCKED) = range(17)
 STATE_TEXT = {"active": "On", "activating": "Starting…", "deactivating": "Stopping…",
               "inactive": "Off", "failed": "Failed"}
 
@@ -53,6 +58,73 @@ def human_time(s):
     return f"{h}h {m}m" if h else f"{m}m {s % 60}s"
 
 
+def fmt_rate(bits_per_sec):
+    if bits_per_sec < 1000:
+        return "0"
+    if bits_per_sec < 1_000_000:
+        return f"{bits_per_sec / 1000:.0f} kbps"
+    return f"{bits_per_sec / 1_000_000:.1f} Mbps"
+
+
+def fmt_limit(kbit):
+    if not kbit:
+        return "no limit"
+    return f"{kbit} kbps" if kbit < 1000 else f"{kbit / 1000:g} Mbps"
+
+
+def fmt_pair(limit):
+    if not limit["down"] and not limit["up"]:
+        return "no limit"
+    return f"↓ {fmt_limit(limit['down'])}  ↑ {fmt_limit(limit['up'])}"
+
+
+def ago(ts):
+    if not ts:
+        return "never"
+    s = max(0, int(time.time()) - ts)
+    for unit, n in (("day", 86400), ("h", 3600), ("min", 60)):
+        if s >= n:
+            v = s // n
+            return f"{v} {unit}{'s' if unit == 'day' and v > 1 else ''} ago"
+    return "just now"
+
+
+_vendors = None
+
+
+def vendor(mac):
+    """Manufacturer from the MAC prefix; phones often use a random ("private") address instead."""
+    global _vendors
+    if int(mac[1], 16) & 2:
+        return "private address"
+    if _vendors is None:
+        _vendors = {}
+        try:
+            with open(OUI_FILE, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "(hex)" in line:
+                        prefix, _, name = line.partition("(hex)")
+                        _vendors[prefix.strip().replace("-", ":").lower()] = name.strip()
+        except OSError:
+            pass
+    return _vendors.get(mac[:8], "")
+
+
+def device_name(d):
+    return d["name"] or d["hostname"] or (vendor(d["mac"]) if vendor(d["mac"]) != "private address" else "") or "Unknown device"
+
+
+def speed_spin(kbit):
+    spin = Gtk.SpinButton.new_with_range(0, 1000, 0.5)
+    spin.set_digits(1)
+    spin.set_value(kbit / 1000)
+    return spin
+
+
+def spin_kbit(spin):
+    return int(round(spin.get_value() * 1000))
+
+
 def wifi_qr_text(ssid, password, hidden):
     esc = lambda s: "".join("\\" + c if c in '\\;,":' else c for c in s)
     return f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(password)};{'H:true;' if hidden else ''};"
@@ -68,7 +140,8 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.settings_loaded = False
         self.busy = False
         self.polling = False
-        self.shown_blocked = None
+        self.device_info = {}
+        self.prev_bytes = {}
 
         header = Gtk.HeaderBar(show_close_button=True, title="Hotspot Manager")
         self.set_titlebar(header)
@@ -106,33 +179,61 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.set_state_text("Loading…", "")
         in_thread(lambda: json.loads(helper("interfaces")), self.on_interfaces)
         in_thread(lambda: helper("get-password", root=True).strip(), self.on_password)
+        in_thread(lambda: vendor("00:00:00:00:00:00"), lambda *_: None)  # load the maker list off the UI thread
 
     # ---- pages -------------------------------------------------------------------------
 
     def build_devices(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
-        # name, ip, mac, signal, link speed, time connected, data used
-        self.devices = Gtk.ListStore(str, str, str, str, str, str, str)
-        self.device_view = Gtk.TreeView(model=self.devices)
-        for i, title in enumerate(["Device", "IP", "MAC", "Signal", "Link ↓ / ↑", "Connected", "Data ↓ / ↑"]):
-            col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i)
-            col.set_resizable(True)
-            self.device_view.append_column(col)
+        bar = Gtk.Box(spacing=8)
+        self.search = Gtk.SearchEntry(placeholder_text="Search by name, IP, MAC or maker")
+        self.search.connect("search-changed", lambda *_: self.device_filter.refilter())
+        bar.pack_start(self.search, True, True, 0)
+        self.show_offline = Gtk.CheckButton(label="Show offline", tooltip_text="Also list devices that connected before")
+        self.show_offline.connect("toggled", lambda *_: self.device_filter.refilter())
+        bar.pack_start(self.show_offline, False, False, 0)
+        limit_all = Gtk.Button(label="Limit all devices…")
+        limit_all.connect("clicked", self.on_limit_all)
+        bar.pack_start(limit_all, False, False, 0)
+        box.pack_start(bar, False, False, 0)
+        self.limits_label = Gtk.Label(xalign=0, wrap=True)
+        self.limits_label.get_style_context().add_class("dim-label")
+        box.pack_start(self.limits_label, False, False, 0)
+
+        self.devices = Gtk.ListStore(str, str, str, str, str, str, float, str, str, int,
+                                     str, float, str, int, str, bool, bool)
+        self.device_filter = self.devices.filter_new()
+        self.device_filter.set_visible_func(self.device_visible)
+        self.device_view = Gtk.TreeView(model=Gtk.TreeModelSort(model=self.device_filter), enable_search=False)
+        self.device_view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.device_view.get_selection().connect("changed", self.on_selection)
+        self.device_view.connect("row-activated", lambda *_: self.on_set_limit())
+        for title, col, sort in (("", C_STATUS, C_ONLINE), ("Device", C_NAME, C_SORT_NAME), ("IP", C_IP, C_IP),
+                                 ("Using now", C_NOW, C_NOW_SORT), ("Speed limit", C_LIMIT, C_LIMIT),
+                                 ("Signal", C_SIGNAL, C_SIGNAL_SORT), ("Data used", C_DATA, C_DATA_SORT),
+                                 ("Connected", C_SEEN, C_SEEN_SORT)):
+            column = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), markup=col)
+            column.set_sort_column_id(sort)
+            column.set_resizable(True)
+            self.device_view.append_column(column)
+        self.device_view.get_model().set_sort_column_id(C_SORT_NAME, Gtk.SortType.ASCENDING)
         scroll = Gtk.ScrolledWindow(vexpand=True, shadow_type=Gtk.ShadowType.IN)
         scroll.add(self.device_view)
         box.pack_start(scroll, True, True, 0)
 
         buttons = Gtk.Box(spacing=6)
-        for label, action, tip in (("Disconnect", "kick", "Kick the device off (it can reconnect)"),
-                                   ("Block", "block", "Kick the device off and stop it from reconnecting")):
-            b = Gtk.Button(label=label, tooltip_text=tip)
-            b.connect("clicked", self.on_device_action, action)
+        self.device_buttons = {}
+        for label, handler, tip in (
+                ("Set speed limit…", lambda *_: self.on_set_limit(), "Limit download/upload speed (or double-click a device)"),
+                ("Rename…", self.on_rename, "Give the device a name you'll recognise"),
+                ("Disconnect", lambda *_: self.on_device_action("kick"), "Kick the device off (it can reconnect)"),
+                ("Block", lambda *_: self.on_device_action("block"), "Kick the device off and stop it from reconnecting"),
+                ("Forget", self.on_forget, "Remove an offline device from the list, with its name and limit")):
+            b = Gtk.Button(label=label, tooltip_text=tip, sensitive=False)
+            b.connect("clicked", handler)
             buttons.pack_start(b, False, False, 0)
+            self.device_buttons[label] = b
         box.pack_start(buttons, False, False, 0)
-
-        box.pack_start(Gtk.Label(label="<b>Blocked devices</b>", use_markup=True, xalign=0), False, False, 6)
-        self.blocked_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        box.pack_start(self.blocked_box, False, False, 0)
         return box
 
     def build_settings(self):
@@ -222,55 +323,97 @@ class HotspotWindow(Gtk.ApplicationWindow):
             self.set_state_text("Hotspot status unavailable", err)
             return
         self.status = st
-        cfg, link, clients = st["config"], st["link"], st["clients"]
-        state = st["state"]
+        cfg, link, state = st["config"], st["link"], st["state"]
         if not self.busy:
             self.switch.handler_block(self.switch_handler)
             self.switch.set_active(state in ("active", "activating"))
             self.switch.handler_unblock(self.switch_handler)
+        down, up = self.fill_devices(st["devices"])
         if state == "active":
-            n = len(clients)
+            n = sum(d["online"] for d in st["devices"])
             summary = (f"{cfg['ssid']}  ·  {cfg['band']} GHz  ·  channel {link.get('channel', cfg['channel'])}"
-                       f"  ·  {link.get('width', cfg['width'])} MHz  ·  {n} device{'s' if n != 1 else ''} connected")
+                       f"  ·  {link.get('width', cfg['width'])} MHz  ·  {n} device{'s' if n != 1 else ''} connected"
+                       f"  ·  using ↓ {fmt_rate(down)}  ↑ {fmt_rate(up)}")
         elif state == "failed":
             summary = st["error"]
         else:
             summary = f"{cfg['ssid']}  ·  {cfg['band']} GHz"
         self.set_state_text(f"Hotspot {STATE_TEXT.get(state, state)}", summary)
+        lim = st["limits"]
+        self.limits_label.set_text(f"Each device: {fmt_pair(lim['default'])}    ·    "
+                                   f"Whole hotspot: {fmt_pair(lim['total'])}")
         if not self.settings_loaded:
             self.fill_settings(cfg, st["boot"])
-        self.fill_devices(clients)
-        self.fill_blocked(st["blocked"], clients)
 
-    def fill_devices(self, clients):
-        model, it = self.device_view.get_selection().get_selected()
-        selected = model[it][2] if it else None
-        self.devices.clear()
-        for c in clients:
-            it = self.devices.append([
-                c["name"] or "Unknown", c["ip"], c["mac"], f"{c['signal']} dBm" if c["signal"] else "",
-                f"{c['down_rate']} / {c['up_rate']} Mbps", human_time(c["connected"]),
-                f"{human_bytes(c['down_bytes'])} / {human_bytes(c['up_bytes'])}"])
-            if c["mac"] == selected:
-                self.device_view.get_selection().select_iter(it)
+    def fill_devices(self, devices):
+        """Update the device list in place (keeps selection and scroll); return total live speed."""
+        now = time.monotonic()
+        rows = {row[C_MAC]: row.iter for row in self.devices}
+        total_down = total_up = 0.0
+        self.device_info = {d["mac"]: d for d in devices}
+        for d in devices:
+            mac, online = d["mac"], d["online"]
+            down = up = 0.0
+            if online:
+                prev = self.prev_bytes.get(mac)
+                if prev and now > prev[2]:
+                    down = max(0, d["down_bytes"] - prev[0]) * 8 / (now - prev[2])
+                    up = max(0, d["up_bytes"] - prev[1]) * 8 / (now - prev[2])
+                self.prev_bytes[mac] = (d["down_bytes"], d["up_bytes"], now)
+                total_down, total_up = total_down + down, total_up + up
+            else:
+                self.prev_bytes.pop(mac, None)
+            name, maker = device_name(d), vendor(mac)
+            details = [x for x in (d["hostname"] if d["name"] else "", maker if maker != name else "", mac) if x]
+            esc = GLib.markup_escape_text
+            if d["blocked"]:
+                status = "<span foreground='#e01b24'>⛔</span>"
+            elif online:
+                status = "<span foreground='#2ec27e'>●</span>"
+            else:
+                status = "<span foreground='#888888'>○</span>"
+            eff, own = d["effective"], d["limit"] is not None
+            limit = fmt_pair(eff)
+            if eff["down"] or eff["up"]:
+                limit = f"<b>{limit}</b>" if own else f"{limit}  <small>(all devices)</small>"
+            values = [
+                mac, status, f"<b>{esc(name)}</b>\n<small>{esc('  ·  '.join(details))}</small>", name.lower(),
+                d["ip"], f"↓ {fmt_rate(down)}\n↑ {fmt_rate(up)}" if online else "", down + up, limit,
+                f"{d['signal']} dBm" if online and d.get("signal") else "", int(d.get("signal") or -999) if online else -999,
+                f"↓ {human_bytes(d['down_bytes'])}\n↑ {human_bytes(d['up_bytes'])}" if online else "",
+                float(d["down_bytes"] + d["up_bytes"]) if online else 0.0,
+                human_time(d["connected"]) if online else ago(d["last_seen"]),
+                -d["connected"] if online else d["last_seen"] - int(time.time()),
+                " ".join([name, d["hostname"], d["ip"], mac, maker]).lower(), online, d["blocked"],
+            ]
+            if mac in rows:
+                self.devices.set_row(rows.pop(mac), values)
+            else:
+                self.devices.append(values)
+        for it in rows.values():
+            self.devices.remove(it)
+        self.on_selection()
+        return total_down, total_up
 
-    def fill_blocked(self, macs, clients):
-        if macs == self.shown_blocked:
-            return
-        self.shown_blocked = macs
-        for child in self.blocked_box.get_children():
-            self.blocked_box.remove(child)
-        names = {c["mac"]: c["name"] for c in clients}
-        if not macs:
-            self.blocked_box.add(Gtk.Label(label="None", xalign=0, margin=6))
-        for mac in macs:
-            row = Gtk.Box(spacing=6, margin=4)
-            row.pack_start(Gtk.Label(label=f"{mac}  {names.get(mac, '')}", xalign=0), True, True, 0)
-            b = Gtk.Button(label="Unblock")
-            b.connect("clicked", lambda _b, m=mac: self.action(lambda: helper("unblock", m, root=True), f"Unblocked {m}"))
-            row.pack_start(b, False, False, 0)
-            self.blocked_box.add(row)
-        self.blocked_box.show_all()
+    def device_visible(self, model, it, _data):
+        if not (model[it][C_ONLINE] or model[it][C_BLOCKED] or self.show_offline.get_active()):
+            return False
+        words = self.search.get_text().lower().split()
+        return all(w in model[it][C_SEARCH] for w in words)
+
+    def selected(self):
+        model, paths = self.device_view.get_selection().get_selected_rows()
+        return [self.device_info[model[p][C_MAC]] for p in paths if model[p][C_MAC] in self.device_info]
+
+    def on_selection(self, *_):
+        sel = self.selected()
+        b = self.device_buttons
+        b["Set speed limit…"].set_sensitive(bool(sel))
+        b["Rename…"].set_sensitive(len(sel) == 1)
+        b["Disconnect"].set_sensitive(any(d["online"] for d in sel))
+        b["Block"].set_sensitive(bool(sel))
+        b["Block"].set_label("Unblock" if sel and all(d["blocked"] for d in sel) else "Block")
+        b["Forget"].set_sensitive(bool(sel) and not any(d["online"] for d in sel))
 
     # ---- settings ----------------------------------------------------------------------
 
@@ -375,14 +518,131 @@ class HotspotWindow(Gtk.ApplicationWindow):
         self.action(lambda: helper("start" if on else "stop", root=True),
                     "Hotspot is on." if on else "Hotspot is off.")
 
-    def on_device_action(self, _button, what):
-        model, it = self.device_view.get_selection().get_selected()
-        if not it:
-            self.notify("Select a device in the list first.", error=True)
+    def on_device_action(self, what):
+        sel = self.selected()
+        if what == "block" and sel and all(d["blocked"] for d in sel):
+            what = "unblock"
+        if what == "kick":
+            sel = [d for d in sel if d["online"]]
+        if not sel:
             return
-        mac, name = model[it][2], model[it][0]
-        done = {"kick": f"Disconnected {name}.", "block": f"Blocked {name}. It can't reconnect until you unblock it."}
-        self.action(lambda: helper(what, mac, root=True), done[what])
+        names = device_name(sel[0]) if len(sel) == 1 else f"{len(sel)} devices"
+        done = {"kick": f"Disconnected {names}.", "unblock": f"Unblocked {names}.",
+                "block": f"Blocked {names}. They can't reconnect until you unblock them."}
+        macs = [d["mac"] for d in sel]
+        self.action(lambda: [helper(what, m, root=True) for m in macs], done[what])
+
+    def set_devices(self, payload, ok_text):
+        self.action(lambda: helper("set-devices", root=True, data=json.dumps(payload)), ok_text)
+
+    def dialog(self, title, ok_label="Apply"):
+        d = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, ok_label, Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        area = d.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(16)
+        return d, area
+
+    @staticmethod
+    def speed_grid(down_spin, up_spin):
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6, margin_start=24)
+        for row, (label, spin) in enumerate((("Download", down_spin), ("Upload", up_spin))):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, row, 1, 1)
+            grid.attach(spin, 1, row, 1, 1)
+            grid.attach(Gtk.Label(label="Mbps   (0 = no limit)", xalign=0), 2, row, 1, 1)
+        return grid
+
+    def on_set_limit(self):
+        sel = self.selected()
+        if not sel:
+            return
+        default = self.status["limits"]["default"]
+        own = sel[0]["limit"] if len(sel) == 1 else None
+        title = device_name(sel[0]) if len(sel) == 1 else f"{len(sel)} devices"
+        dialog, area = self.dialog(f"Speed limit: {title}")
+        r_default = Gtk.RadioButton(label=f"Same as all devices ({fmt_pair(default)})")
+        r_none = Gtk.RadioButton.new_with_label_from_widget(r_default, "No limit")
+        r_custom = Gtk.RadioButton.new_with_label_from_widget(r_default, "Custom limit:")
+        start = own or (default if default["down"] or default["up"] else {"down": 10000, "up": 5000})
+        down_spin, up_spin = speed_spin(start["down"]), speed_spin(start["up"])
+        grid = self.speed_grid(down_spin, up_spin)
+        presets = Gtk.Box(spacing=4, margin_start=24)
+        presets.pack_start(Gtk.Label(label="Quick:"), False, False, 0)
+        for mbps in (1, 2, 5, 10, 20, 50):
+            b = Gtk.Button(label=f"{mbps} Mbps")
+            b.connect("clicked", lambda _b, v=mbps: (r_custom.set_active(True), down_spin.set_value(v), up_spin.set_value(v)))
+            presets.pack_start(b, False, False, 0)
+        for w in (r_default, r_none, r_custom, grid, presets):
+            area.add(w)
+        r_custom.connect("toggled", lambda r: grid.set_sensitive(r.get_active()))
+        if own is None:
+            r_default.set_active(True)
+        elif not own["down"] and not own["up"]:
+            r_none.set_active(True)
+        else:
+            r_custom.set_active(True)
+        grid.set_sensitive(r_custom.get_active())
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            if r_default.get_active():
+                limit = None
+            elif r_none.get_active():
+                limit = {"down": 0, "up": 0}
+            else:
+                limit = {"down": spin_kbit(down_spin), "up": spin_kbit(up_spin)}
+            self.set_devices({"devices": {d["mac"]: {"limit": limit} for d in sel}},
+                             f"Speed limit for {title}: {fmt_pair(limit or default)}.")
+        dialog.destroy()
+
+    def on_limit_all(self, *_):
+        lim = self.status.get("limits") or {k: {"down": 0, "up": 0} for k in ("default", "total")}
+        dialog, area = self.dialog("Limit all devices")
+        each = [speed_spin(lim["default"]["down"]), speed_spin(lim["default"]["up"])]
+        total = [speed_spin(lim["total"]["down"]), speed_spin(lim["total"]["up"])]
+        area.add(Gtk.Label(label="<b>Each device</b>\n<small>Every device gets at most this much, "
+                                 "unless you gave it its own limit.</small>", use_markup=True, xalign=0))
+        area.add(self.speed_grid(*each))
+        area.add(Gtk.Label(label="<b>Whole hotspot</b>\n<small>All devices together share at most this much.</small>",
+                           use_markup=True, xalign=0))
+        area.add(self.speed_grid(*total))
+        own = [mac for mac, d in self.device_info.items() if d["limit"] is not None]
+        override = Gtk.CheckButton(label=f"Also replace the {len(own)} device-specific limit{'s' if len(own) != 1 else ''}")
+        if own:
+            area.add(override)
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            payload = {"default": {"down": spin_kbit(each[0]), "up": spin_kbit(each[1])},
+                       "total": {"down": spin_kbit(total[0]), "up": spin_kbit(total[1])}}
+            if override.get_active():
+                payload["devices"] = {mac: {"limit": None} for mac in own}
+            self.set_devices(payload, f"Each device: {fmt_pair(payload['default'])}. "
+                                      f"Whole hotspot: {fmt_pair(payload['total'])}.")
+        dialog.destroy()
+
+    def on_rename(self, *_):
+        sel = self.selected()
+        if len(sel) != 1:
+            return
+        d = sel[0]
+        dialog, area = self.dialog("Rename device", "Save")
+        area.add(Gtk.Label(label=f"MAC {d['mac']}" + (f"  ·  calls itself “{d['hostname']}”" if d["hostname"] else ""), xalign=0))
+        entry = Gtk.Entry(text=d["name"], max_length=40, activates_default=True,
+                          placeholder_text=d["hostname"] or "e.g. Ahmed's phone")
+        area.add(entry)
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            name = entry.get_text().strip()
+            self.set_devices({"devices": {d["mac"]: {"name": name}}},
+                             f"Renamed to {name}." if name else "Name cleared.")
+        dialog.destroy()
+
+    def on_forget(self, *_):
+        sel = [d for d in self.selected() if not d["online"]]
+        if sel:
+            self.set_devices({"devices": {d["mac"]: None for d in sel}},
+                             f"Forgot {device_name(sel[0]) if len(sel) == 1 else f'{len(sel)} devices'}.")
 
     def on_page(self, *_):
         if self.stack.get_visible_child_name() == "log":

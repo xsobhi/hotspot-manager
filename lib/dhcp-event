@@ -1,0 +1,3 @@
+#!/bin/sh
+# dnsmasq --dhcp-script hook: "add|old|del MAC IP [HOSTNAME]" -> remember the device, re-apply speed limits.
+exec /usr/local/bin/hotspotctl _lease "$@"

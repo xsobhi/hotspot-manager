@@ -5,15 +5,16 @@ set -e
 cd "$(dirname "$0")"
 
 if command -v apt-get >/dev/null; then
-    apt-get install -y hostapd iw dnsmasq-base iptables qrencode python3-gi gir1.2-gtk-3.0
+    apt-get install -y hostapd iw dnsmasq-base iptables iproute2 ieee-data qrencode python3-gi gir1.2-gtk-3.0
 else
-    echo "Not a Debian/Ubuntu system: install hostapd, iw, dnsmasq, iptables, qrencode and PyGObject (GTK 3) yourself." >&2
+    echo "Not a Debian/Ubuntu system: install hostapd, iw, dnsmasq, iptables, iproute2 (tc), qrencode and PyGObject (GTK 3) yourself." >&2
 fi
 # The distro's own hostapd unit is not used (and fails without its config file).
 systemctl disable --now hostapd.service 2>/dev/null || true
 
 install -m 755 bin/hotspotctl /usr/local/bin/hotspotctl
 install -m 755 bin/hotspot-manager /usr/local/bin/hotspot-manager
+install -D -m 755 lib/dhcp-event /usr/local/lib/hotspot-manager/dhcp-event
 install -m 644 systemd/hotspot-manager.service /etc/systemd/system/hotspot-manager.service
 install -m 644 polkit/io.github.xsobhi.hotspot-manager.policy /usr/share/polkit-1/actions/
 install -D -m 644 desktop/hotspot-manager.desktop /usr/local/share/applications/hotspot-manager.desktop

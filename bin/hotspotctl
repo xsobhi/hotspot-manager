@@ -2,9 +2,11 @@
 """hotspotctl - privileged helper for Hotspot Manager.
 
 Runs a Wi-Fi access point with hostapd, hands out addresses with dnsmasq and shares the
-internet connection through NAT. The GUI calls it through pkexec; `status`, `interfaces`
-and `logs` also work as a normal user.
+internet connection through NAT, and applies per-device / all-devices speed limits with tc.
+The GUI calls it through pkexec; `status`, `interfaces` and `logs` also work as a normal user.
 """
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -17,6 +19,12 @@ CONF_DIR = "/etc/hotspot-manager"
 CONFIG = os.path.join(CONF_DIR, "config.json")
 PASSWORD = os.path.join(CONF_DIR, "password")
 BLOCKED = os.path.join(CONF_DIR, "blocked")
+DEVICES = os.path.join(CONF_DIR, "devices.json")
+LIMITS = os.path.join(CONF_DIR, "limits.json")
+LOCK = os.path.join(CONF_DIR, ".lock")
+DHCP_HOOK = "/usr/local/lib/hotspot-manager/dhcp-event"
+IFB = "hm-ifb0"  # upload traffic is redirected here so it can be shaped like download
+MAX_KBIT = 10_000_000
 RUN = "/run/hotspot-manager"
 HOSTAPD_CONF = os.path.join(RUN, "hostapd.conf")
 CTRL = os.path.join(RUN, "ctrl")
@@ -84,6 +92,62 @@ def load_state():
         return json.loads(read(STATE) or "{}")
     except ValueError:
         return {}
+
+
+def load_json(path, default):
+    try:
+        data = json.loads(read(path) or "null")
+    except ValueError:
+        data = None
+    return data if isinstance(data, type(default)) else default
+
+
+def load_devices():
+    """Remembered devices: {mac: {"name", "hostname", "ip", "last_seen", "limit": {down, up}}}."""
+    return {m: d for m, d in load_json(DEVICES, {}).items() if MAC_RE.match(m) and isinstance(d, dict)}
+
+
+def load_limits():
+    """{"default": per-device limit, "total": whole-hotspot limit}, each {down, up} in kbit/s (0 = none)."""
+    raw = load_json(LIMITS, {})
+    res = {}
+    for key in ("default", "total"):
+        pair = raw.get(key) if isinstance(raw.get(key), dict) else {}
+        res[key] = {d: pair[d] if type(pair.get(d)) is int else 0 for d in ("down", "up")}
+    return res
+
+
+def device_limit(dev, limits):
+    """A device's own limit if it has one, else the all-devices limit."""
+    return dev["limit"] if isinstance(dev.get("limit"), dict) else limits["default"]
+
+
+def leases():
+    res = {}
+    for line in read(LEASES).splitlines():
+        p = line.split()
+        if len(p) >= 4 and MAC_RE.match(p[1].lower()):
+            res[p[1].lower()] = {"ip": p[2], "hostname": "" if p[3] == "*" else p[3]}
+    return res
+
+
+@contextlib.contextmanager
+def locked():
+    """Serialise read-modify-write of the device files (the GUI and dnsmasq's hook both write them)."""
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(LOCK, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def read_stdin_json():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise Error("expected a JSON object on stdin")
+    return data
 
 
 def blocked():
@@ -246,12 +310,97 @@ def start_dnsmasq(iface):
     run(["dnsmasq", "--conf-file=/dev/null", "--no-hosts", f"--interface={iface}", "--bind-dynamic",
          f"--listen-address={GATEWAY}", f"--dhcp-range={SUBNET}.10,{SUBNET}.254,255.255.255.0,12h",
          f"--dhcp-option=option:router,{GATEWAY}", f"--dhcp-option=option:dns-server,{GATEWAY}",
-         "--dhcp-authoritative", f"--dhcp-leasefile={LEASES}", f"--pid-file={DNSMASQ_PID}"])
+         "--dhcp-authoritative", f"--dhcp-leasefile={LEASES}", f"--pid-file={DNSMASQ_PID}",
+         f"--dhcp-script={DHCP_HOOK}"])
 
 
 def set_ip_forward(value):
     with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
         f.write(value)
+
+
+# ---- speed limits ------------------------------------------------------------------------
+
+def shaping_down(iface):
+    quiet(["tc", "qdisc", "del", "dev", iface, "root"])
+    quiet(["tc", "qdisc", "del", "dev", iface, "ingress"])
+    quiet(["ip", "link", "del", IFB])
+
+
+def htb(dev, total, items, match):
+    """Shape traffic leaving dev: an optional total cap, plus one capped class per (ip, kbit) item.
+    Everything else goes to the default class 1:ffff, limited only by the total."""
+    top = total or MAX_KBIT
+    tc = lambda *a: run(["tc", *a])
+
+    def htb_class(parent, cid, kbit):
+        # tc's default burst (~1600 bytes) is too small to reach high rates; allow ~5 ms of traffic.
+        burst = str(max(3200, kbit * 5 // 8))
+        tc("class", "add", "dev", dev, "parent", parent, "classid", cid, "htb", "rate", f"{kbit}kbit",
+           "ceil", f"{kbit}kbit", "burst", burst, "cburst", burst,
+           "quantum", str(max(1514, min(60000, kbit * 125 // 10))))
+
+    tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "ffff")
+    htb_class("1:", "1:1", top)
+    htb_class("1:1", "1:ffff", top)
+    tc("qdisc", "add", "dev", dev, "parent", "1:ffff", "fq_codel")
+    for n, (ip, kbit) in enumerate(items, start=2):
+        cid = f"1:{n:x}"
+        htb_class("1:1", cid, min(kbit, top))
+        tc("qdisc", "add", "dev", dev, "parent", cid, "fq_codel")
+        tc("filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
+           "flower", match, ip, "classid", cid)
+
+
+def apply_shaping(changed=None):
+    """Rebuild the tc setup from the saved limits for every device that has a DHCP lease.
+    changed=(event, mac, ip) covers a lease dnsmasq is reporting but may not have written yet."""
+    iface = load_state().get("interface")
+    if not iface:
+        return
+    limits, devices, active = load_limits(), load_devices(), {m: l["ip"] for m, l in leases().items()}
+    if changed:
+        event, mac, ip = changed
+        if event == "del":
+            active.pop(mac, None)
+        else:
+            active[mac] = ip
+    down, up = [], []
+    for mac, ip in sorted(active.items(), key=lambda kv: kv[1]):
+        lim = device_limit(devices.get(mac, {}), limits)
+        if lim["down"]:
+            down.append((ip, lim["down"]))
+        if lim["up"]:
+            up.append((ip, lim["up"]))
+    shaping_down(iface)
+    # Download = traffic the laptop sends out of the hotspot adapter.
+    if down or limits["total"]["down"]:
+        htb(iface, limits["total"]["down"], down, "dst_ip")
+    # Upload arrives on the adapter; redirect it through an IFB device so it can be queued too.
+    if up or limits["total"]["up"]:
+        run(["ip", "link", "add", IFB, "type", "ifb"])
+        run(["ip", "link", "set", IFB, "up"])
+        run(["tc", "qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"])
+        run(["tc", "filter", "add", "dev", iface, "parent", "ffff:", "protocol", "all", "matchall",
+             "action", "mirred", "egress", "redirect", "dev", IFB])
+        htb(IFB, limits["total"]["up"], up, "src_ip")
+
+
+def lease_event(args):
+    """dnsmasq --dhcp-script hook: remember the device and re-apply speed limits."""
+    if len(args) < 3 or args[0] not in ("add", "old", "del") or not MAC_RE.match(args[1].lower()):
+        return
+    event, mac, ip = args[0], args[1].lower(), args[2]
+    hostname = "".join(c for c in (args[3] if len(args) > 3 else "") if c.isprintable())[:63]
+    with locked():
+        devices = load_devices()
+        dev = devices.setdefault(mac, {})
+        if event != "del":
+            dev.update(ip=ip, last_seen=int(time.time()))
+            if hostname:
+                dev["hostname"] = hostname
+        write(DEVICES, json.dumps(devices, indent=1) + "\n")
+        apply_shaping((event, mac, ip))
 
 
 # ---- service hooks (run by systemd) -----------------------------------------------------
@@ -292,6 +441,8 @@ def pre_start():
 def post_start():
     """ExecStartPost: start DHCP/DNS (here, not in _pre, so systemd doesn't see a stray process)."""
     start_dnsmasq(load_state()["interface"])
+    with locked():
+        apply_shaping()
 
 
 def post_stop():
@@ -301,6 +452,7 @@ def post_stop():
     firewall_down()
     iface = st.get("interface")
     if iface:
+        shaping_down(iface)
         quiet(["ip", "addr", "flush", "dev", iface])
         quiet(["nmcli", "device", "set", iface, "managed", "yes"])
     if st.get("ip_forward") == "0":
@@ -373,12 +525,7 @@ def validate(cfg):
 def cmd_set_config():
     """Read a JSON object from stdin: any config keys, plus optional "password" and "boot"."""
     need_root()
-    try:
-        data = json.load(sys.stdin)
-    except ValueError:
-        raise Error("expected a JSON object on stdin")
-    if not isinstance(data, dict):
-        raise Error("expected a JSON object on stdin")
+    data = read_stdin_json()
     cfg = load_config()
     cfg.update({k: data[k] for k in DEFAULTS if k in data})
     validate(cfg)
@@ -396,6 +543,61 @@ def cmd_set_config():
         run(["systemctl", "enable" if data["boot"] else "disable", SERVICE])
     if service_state() in ("active", "activating"):
         cmd_restart()
+
+
+def speed_pair(value, what):
+    if not isinstance(value, dict):
+        raise Error(f"{what} must be an object with down and up")
+    res = {}
+    for d in ("down", "up"):
+        v = value.get(d, 0)
+        if type(v) is not int or not 0 <= v <= MAX_KBIT:
+            raise Error(f"{what} {d} must be 0-{MAX_KBIT} kbit/s")
+        res[d] = v
+    return res
+
+
+def cmd_set_devices():
+    """Read JSON from stdin, speeds in kbit/s (0 = no limit):
+    {"default"?: {down, up}, "total"?: {down, up},
+     "devices"?: {mac: null (forget it) | {"name"?: str, "limit"?: {down, up} | null (use default)}}}"""
+    need_root()
+    data = read_stdin_json()
+    changes = data.get("devices") or {}
+    if not isinstance(changes, dict):
+        raise Error("devices must be an object keyed by MAC address")
+    with locked():
+        limits, devices = load_limits(), load_devices()
+        for key in ("default", "total"):
+            if key in data:
+                limits[key] = speed_pair(data[key], key)
+        for mac, change in changes.items():
+            mac = mac.lower()
+            if not MAC_RE.match(mac):
+                raise Error(f"bad MAC address {mac!r}")
+            if change is None:
+                devices.pop(mac, None)
+                continue
+            if not isinstance(change, dict):
+                raise Error("each device change must be an object or null")
+            dev = devices.setdefault(mac, {})
+            if "name" in change:
+                name = change["name"]
+                if not isinstance(name, str) or len(name) > 40 or not name.isprintable():
+                    raise Error("device names must be up to 40 printable characters")
+                if name.strip():
+                    dev["name"] = name.strip()
+                else:
+                    dev.pop("name", None)
+            if "limit" in change:
+                if change["limit"] is None:
+                    dev.pop("limit", None)
+                else:
+                    dev["limit"] = speed_pair(change["limit"], "limit")
+        write(LIMITS, json.dumps(limits, indent=1) + "\n")
+        write(DEVICES, json.dumps(devices, indent=1) + "\n")
+        if service_state() == "active":
+            apply_shaping()
 
 
 def cmd_get_password():
@@ -438,30 +640,36 @@ def cmd_status():
     cfg = load_config()
     state = service_state()
     iface = load_state().get("interface", "")
-    link, clients = {}, []
+    link, online = {}, {}
     if state == "active" and iface:
         m = re.search(r"channel (\d+) \((\d+) MHz\), width: (\d+) MHz", quiet(["iw", "dev", iface, "info"]).stdout)
         if m:
             link = {"channel": int(m[1]), "freq": int(m[2]), "width": int(m[3])}
-        leases = {}
-        for line in read(LEASES).splitlines():
-            p = line.split()
-            if len(p) >= 4:
-                leases[p[1].lower()] = {"ip": p[2], "name": "" if p[3] == "*" else p[3]}
         dump = quiet(["iw", "dev", iface, "station", "dump"]).stdout
         for block in re.split(r"^Station ", dump, flags=re.M)[1:]:
             mac = block.split()[0].lower()
             f = dict(re.findall(r"^\s+([^:\n]+):\s+(.*)$", block, re.M))
             first = lambda key: (f.get(key) or "").split(" ")[0]
-            clients.append({"mac": mac, **leases.get(mac, {"ip": "", "name": ""}),
-                            "signal": first("signal"), "down_rate": first("tx bitrate"),
+            online[mac] = {"signal": first("signal"), "down_rate": first("tx bitrate"),
                             "up_rate": first("rx bitrate"), "down_bytes": int(first("tx bytes") or 0),
                             "up_bytes": int(first("rx bytes") or 0),
-                            "connected": int(first("connected time") or 0)})
+                            "connected": int(first("connected time") or 0)}
+    known, limits, lease, blocked_macs = load_devices(), load_limits(), leases(), blocked()
+    now = int(time.time())
+    devices = []
+    for mac in sorted(set(known) | set(online) | set(blocked_macs)):
+        dev, live, ls = known.get(mac, {}), online.get(mac), lease.get(mac, {})
+        devices.append({
+            "mac": mac, "name": dev.get("name", ""), "hostname": ls.get("hostname") or dev.get("hostname", ""),
+            "ip": ls.get("ip") or dev.get("ip", ""), "online": live is not None, "blocked": mac in blocked_macs,
+            "last_seen": now if live else dev.get("last_seen", 0),
+            "limit": dev.get("limit"), "effective": device_limit(dev, limits), **(live or {}),
+        })
     print(json.dumps({
         "state": state,
         "boot": quiet(["systemctl", "is-enabled", SERVICE]).stdout.strip() == "enabled",
-        "config": cfg, "interface": iface, "link": link, "clients": clients, "blocked": blocked(),
+        "config": cfg, "interface": iface, "link": link, "devices": devices, "limits": limits,
+        "blocked": blocked_macs,
         "error": last_error() if state == "failed" else "",
     }))
 
@@ -473,17 +681,18 @@ def cmd_logs():
 COMMANDS = {
     "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart, "status": cmd_status,
     "interfaces": lambda: print(json.dumps(wireless_ifaces())), "logs": cmd_logs,
-    "set-config": cmd_set_config, "get-password": cmd_get_password,
+    "set-config": cmd_set_config, "set-devices": cmd_set_devices, "get-password": cmd_get_password,
     "_pre": lambda: (need_root(), pre_start()), "_started": lambda: (need_root(), post_start()),
     "_post": lambda: (need_root(), post_stop()),
 }
-MAC_COMMANDS = {"kick": cmd_kick, "block": cmd_block, "unblock": cmd_unblock}
+MAC_COMMANDS = {"kick": cmd_kick, "block": cmd_block, "unblock": cmd_unblock,
+                "_lease": lambda args: (need_root(), lease_event(args))}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in {**COMMANDS, **MAC_COMMANDS}:
-        print("usage: hotspotctl start|stop|restart|status|interfaces|logs|set-config|get-password|"
-              "kick MAC|block MAC|unblock MAC", file=sys.stderr)
+        print("usage: hotspotctl start|stop|restart|status|interfaces|logs|set-config|set-devices|"
+              "get-password|kick MAC|block MAC|unblock MAC", file=sys.stderr)
         sys.exit(2)
     cmd = sys.argv[1]
     try:

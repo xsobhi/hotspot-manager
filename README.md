@@ -6,8 +6,12 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
 - **On/off switch**, and an option to turn it on at startup
 - **Name, password, band (5 / 2.4 GHz), channel, channel width (20 / 40 / 80 MHz)**, country,
   hidden network, max devices, and isolating devices from each other
-- **Connected devices**: name, IP, MAC, signal, link speed, time connected and data used, with
-  **Disconnect** and **Block / Unblock** buttons
+- **Devices**: every device that's connected (or has been), with its name, maker, IP, MAC, signal,
+  **live speed it's using right now**, data used and time connected. Search them, sort by any column, and
+  give them names you'll recognise
+- **Speed limits**: per device, for **all devices** at once, and/or a **total** for the whole hotspot, separately
+  for download and upload. Devices are remembered by MAC address, so a limit sticks when they reconnect
+- **Disconnect**, **Block / Unblock** and **Forget** for devices
 - **Share** button with the name, password and a QR code your phone camera can scan to join
 - **Log** tab, so you can see why it failed to start
 
@@ -25,6 +29,7 @@ It's a thin layer over standard tools:
 | `hostapd` | runs the access point (WPA2, 802.11n/ac) |
 | `dnsmasq` | gives devices an address in `10.42.0.0/24` and forwards DNS |
 | `iptables` | NAT to whatever connection the laptop is using, plus rules that work with ufw on |
+| `tc` (HTB + fq_codel, IFB for upload) | speed limits |
 | `hotspotctl` | small root helper that ties it together, run as the `hotspot-manager` systemd service |
 | `hotspot-manager` | the GTK 3 window |
 
@@ -65,12 +70,38 @@ sudo hotspotctl block aa:bb:cc:dd:ee:ff
 Uninstall with `sudo ./uninstall.sh`, or `sudo ./uninstall.sh --purge` to also delete the settings in
 `/etc/hotspot-manager`.
 
+## Speed limits
+
+Open **Devices**, select one or more devices, then click **Set speed limit…** (or double-click a device). Choose:
+
+- **Same as all devices**: follow the all-devices limit (the default for every device)
+- **No limit**: this device is never limited, even when all devices are
+- **Custom**: its own download/upload limit, with quick buttons for 1–50 Mbps
+
+**Limit all devices…** sets the per-device limit everyone gets by default, and an optional **whole-hotspot** cap
+that everyone shares.
+
+How it works: when a device gets an address, dnsmasq's lease hook records it and rebuilds the `tc` setup.
+Download is shaped with an HTB class per limited device on the hotspot adapter, matched by IP. Upload is
+redirected to an IFB device (`hm-ifb0`) and shaped the same way. Each class uses fq_codel, so a limited
+device still gets low latency. Devices with a manually set (static) IP aren't matched, because limits
+follow DHCP leases.
+
+Settings live in `/etc/hotspot-manager/devices.json` (names, limits, last seen) and `limits.json`.
+From the command line (speeds in kbit/s, 0 = no limit):
+
+```sh
+echo '{"default": {"down": 10000, "up": 5000}}' | sudo hotspotctl set-devices
+echo '{"devices": {"aa:bb:cc:dd:ee:ff": {"name": "Living room TV", "limit": {"down": 3000, "up": 1000}}}}' \
+  | sudo hotspotctl set-devices
+```
+
 ## Permissions
 
 The polkit rule lets the **logged-in local user** run `hotspotctl` as root without a password. That's how the
 app can save settings and flip the switch without prompting, like NetworkManager's own hotspot. Remote and
 inactive sessions still need an admin password. `hotspotctl` validates every input: the SSID,
-password, channel, country code, adapter name and MAC addresses. If you want a password prompt every time,
+password, channel, country code, adapter name, MAC addresses, device names and speed values. If you want a password prompt every time,
 change `allow_active` to `auth_admin_keep` in `/usr/share/polkit-1/actions/io.github.xsobhi.hotspot-manager.policy`.
 
 The Wi-Fi password is stored in `/etc/hotspot-manager/password` (root-only, mode 600).
