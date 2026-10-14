@@ -122,7 +122,9 @@ pub fn run(stop: &AtomicBool) {
 /// Every two seconds: follow the hotspot (on, off, its adapter), who's on it, and the rules.
 fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     let adapter = net::hotspot_adapter();
-    let gateway = net::gateway();
+    // the address Windows really gave the hotspot (the one asked for applies from its next start)
+    let gateway = adapter.as_ref().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
+        .unwrap_or_else(net::gateway);
     let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway;
     if running.as_ref().is_some_and(|r| !same(r)) {
         running.take().unwrap().stop();
