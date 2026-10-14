@@ -38,17 +38,23 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(shared: Arc<Mutex<Shared>>, gateway: Ip) -> Result<Engine, String> {
-        let net = format!("{}.{}.{}", gateway[0], gateway[1], gateway[2]);
-        let filter = format!("ip and ((ip.SrcAddr >= {net}.0 and ip.SrcAddr <= {net}.255) or \
-                              (ip.DstAddr >= {net}.0 and ip.DstAddr <= {net}.255))");
+    /// Count and limit the devices' traffic: they're in `gateway`'s subnet; Windows' sharing is
+    /// in `own`'s (the same, unless another hotspot address was asked for: then their packets
+    /// pass Windows' sharing as if from its subnet, and come back translated).
+    pub fn start(shared: Arc<Mutex<Shared>>, gateway: Ip, own: Ip) -> Result<Engine, String> {
+        let subnet = |ip: Ip| {
+            let net = format!("{}.{}.{}", ip[0], ip[1], ip[2]);
+            format!("(ip.SrcAddr >= {net}.0 and ip.SrcAddr <= {net}.255) or (ip.DstAddr >= {net}.0 and ip.DstAddr <= {net}.255)")
+        };
+        let filter = if own[..3] == gateway[..3] { format!("ip and ({})", subnet(gateway)) }
+                     else { format!("ip and ({} or {})", subnet(gateway), subnet(own)) };
         let divert = Arc::new(Divert::open(&filter, LAYER_FORWARD, 0)?);
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (divert.clone(), shared.clone());
         let capture = std::thread::spawn(move || {
             let mut buffer = vec![0u8; 65535];
             while let Some((n, address)) = d.recv(&mut buffer) {
-                if let Some((packet, address)) = handle(&s, &buffer[..n], address, gateway) {
+                if let Some((packet, address)) = handle(&s, &buffer[..n], address, gateway, own) {
                     d.send(&packet, &address);
                 }
             }
@@ -77,7 +83,7 @@ impl Engine {
                 }
             }
         });
-        log::line(format!("Counting and limiting the hotspot's traffic ({net}.x)"));
+        log::line(format!("Counting and limiting the hotspot's traffic ({}.{}.{}.x)", gateway[0], gateway[1], gateway[2]));
         Ok(Engine { divert, stop, threads: vec![capture, release] })
     }
 
@@ -91,26 +97,46 @@ impl Engine {
 }
 
 /// A packet between a device and the rest: Some(it) to send on now; None: it waits or is dropped.
-fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) -> Option<Packet> {
-    let pass = || Some((packet.to_vec(), address));
+fn handle(shared: &Mutex<Shared>, packet: &[u8], mut address: Address, gateway: Ip, own: Ip) -> Option<Packet> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return pass();
+        return Some((packet.to_vec(), address));
     }
-    let (src, dst): (Ip, Ip) = (packet[12..16].try_into().unwrap(), packet[16..20].try_into().unwrap());
+    let mut packet = packet.to_vec();
+    let ip = |p: &[u8], at: usize| -> Ip { p[at..at + 4].try_into().unwrap() };
     let ours = |ip: Ip| ip[..3] == gateway[..3];
+    let windows = |ip: Ip| own[..3] != gateway[..3] && ip[..3] == own[..3];
+    // another address than Windows' own: out as from Windows' subnet, back to the device's
+    let (src, dst) = (ip(&packet, 12), ip(&packet, 16));
+    let translated = if ours(src) && !ours(dst) && !windows(dst) {
+        packet[12..15].copy_from_slice(&own[..3]);
+        true
+    } else if windows(dst) && dst != own && !ours(src) && !windows(src) {
+        packet[16..19].copy_from_slice(&gateway[..3]);
+        true
+    } else {
+        false
+    };
+    if translated {
+        Divert::checksums(&mut packet, &mut address);
+    }
+    let device = |ip: Ip| if windows(ip) { [gateway[0], gateway[1], gateway[2], ip[3]] } else { ip };
+    let (src, dst) = (device(ip(&packet, 12)), device(ip(&packet, 16)));
     let mut s = shared.lock().unwrap();
     if ours(src) && ours(dst) {
         // from one device to another
         let apart = s.rules.isolate && src != gateway && dst != gateway;
-        return if apart { None } else { pass() };
+        return if apart { None } else { Some((packet, address)) };
     }
     let (device, down) = match (ours(dst), ours(src)) {
         (true, _) => (dst, true),
         (_, true) => (src, false),
-        _ => return pass(),
+        _ => return Some((packet, address)),
     };
     if device == gateway || device[3] == 255 {
-        return pass();
+        return Some((packet, address));
+    }
+    if s.rules.local_only {
+        return None; // "Share internet" is off: the devices only reach each other and the PC
     }
     let used = s.usage.entry(device).or_default();
     if down { used.0 += packet.len() as u64 } else { used.1 += packet.len() as u64 }
@@ -123,7 +149,7 @@ fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) 
     let wanted = shape::direction(&limit, down);
     let total = if down { s.rules.total.down } else { s.rules.total.up };
     if wanted.0 == 0 && total == 0 {
-        return pass();
+        return Some((packet, address));
     }
     let now = Instant::now();
     let lanes = &mut s.lanes;
@@ -138,43 +164,6 @@ fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) 
     if lane.limit != wanted {
         *lane = Lane::new(wanted, now);
     }
-    lane.offer((packet.to_vec(), address), packet.len(), lanes.totals[down as usize].as_mut(), now)
-}
-
-/// Where the hotspot's traffic shows up (for the log, when something doesn't work): ten seconds
-/// of watching both layers without touching anything.
-pub fn diagnose(gateway: Ip, hotspot: u32) {
-    let net = format!("{}.{}.{}", gateway[0], gateway[1], gateway[2]);
-    let any = format!("ip and ((ip.SrcAddr >= {net}.0 and ip.SrcAddr <= {net}.255) or \
-                       (ip.DstAddr >= {net}.0 and ip.DstAddr <= {net}.255))");
-    for (name, layer, filter) in [("forwarded", LAYER_FORWARD, any.clone()),
-                                  ("to/from this PC", super::divert::LAYER_NETWORK, format!("ifIdx == {hotspot} or ({any})"))] {
-        let found = Arc::new(Mutex::new(std::collections::BTreeMap::<String, (u64, u64)>::new()));
-        let Ok(divert) = Divert::sniff(&filter, layer) else { continue };
-        let divert = Arc::new(divert);
-        let (d, f) = (divert.clone(), found.clone());
-        let watcher = std::thread::spawn(move || {
-            let mut buffer = vec![0u8; 65535];
-            while let Some((n, a)) = d.recv(&mut buffer) {
-                if n >= 20 {
-                    let key = format!("{} {}.{}.{}.{} → {}.{}.{}.{} (if {})", if a.outbound() { "out" } else { "in" },
-                                      buffer[12], buffer[13], buffer[14], buffer[15], buffer[16], buffer[17], buffer[18],
-                                      buffer[19], a.if_idx);
-                    let mut f = f.lock().unwrap();
-                    let entry = f.entry(key).or_default();
-                    (entry.0, entry.1) = (entry.0 + 1, entry.1 + n as u64);
-                }
-            }
-        });
-        std::thread::sleep(Duration::from_secs(10));
-        divert.shutdown();
-        let _ = watcher.join();
-        let found = found.lock().unwrap();
-        log::line(format!("Diagnosis, {name}: {} kinds of packets", found.len()));
-        let mut busiest: Vec<_> = found.iter().collect();
-        busiest.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
-        for (key, (count, bytes)) in busiest.into_iter().take(12) {
-            log::line(format!("  {key}: {count} packets, {bytes} bytes"));
-        }
-    }
+    let size = packet.len();
+    lane.offer((packet, address), size, lanes.totals[down as usize].as_mut(), now)
 }

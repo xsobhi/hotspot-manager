@@ -6,6 +6,7 @@
 
 pub mod dhcp;
 mod dhcpd;
+mod diagnose;
 mod divert;
 mod engine;
 mod ics;
@@ -14,6 +15,7 @@ mod pipe;
 mod requests;
 pub mod service;
 pub mod shape;
+mod steer;
 
 use crate::net;
 use crate::rules::Rules;
@@ -80,6 +82,7 @@ pub fn shared() -> &'static Arc<Mutex<Shared>> {
 /// What's running for the hotspot now.
 struct Running {
     gateway: Ip,
+    own: Ip, // Windows' own address for the hotspot
     hotspot: u32,
     engine: Option<Engine>,
     dhcp: Option<dhcpd::DhcpServer>,
@@ -132,7 +135,7 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     if let Some(a) = adapter.as_ref().filter(|a| windows_own != wanted && !a.ipv4.contains(&wanted)) {
         add_address(a, wanted);
     }
-    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway;
+    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway && r.own == windows_own;
     if running.as_ref().is_some_and(|r| !same(r)) {
         running.take().unwrap().stop();
         log::line("The hotspot is off");
@@ -141,13 +144,13 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     let own_dhcp = shared.lock().unwrap().rules.network.own_dhcp() || gateway != windows_own;
     let r = running.get_or_insert_with(|| {
         log::line(format!("The hotspot is on: {} ({})", adapter.friendly, adapter.name));
-        let engine = Engine::start(shared.clone(), gateway);
+        let engine = Engine::start(shared.clone(), gateway, windows_own);
         let mut s = shared.lock().unwrap();
         s.problem = engine.as_ref().err().cloned().unwrap_or_default();
         if !s.problem.is_empty() {
             log::line(format!("Can't count or limit traffic: {}", s.problem));
         }
-        Running { gateway, hotspot: adapter.index, engine: engine.ok(), dhcp: None }
+        Running { gateway, own: windows_own, hotspot: adapter.index, engine: engine.ok(), dhcp: None }
     });
     if own_dhcp != r.dhcp.is_some() {
         if let Some(d) = r.dhcp.take() {

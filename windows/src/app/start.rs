@@ -77,7 +77,7 @@ pub fn run() -> i32 {
         window: window.clone(), store: RefCell::new(Store::load()), status: RefCell::default(), busy: Cell::default(),
         note: RefCell::default(), speed: Cell::default(), traffic: Cell::default(), asking: Cell::new(false),
         ticks: Cell::new(0), top, devices, settings, rules: RefCell::default(),
-        helper: RefCell::new(Err(String::new())), rates: RefCell::default(),
+        helper: RefCell::new(Err(String::new())), rates: RefCell::default(), radio: RefCell::default(),
     });
     APP.with(|a| { let _ = a.set(this.clone()); });
     window.hook(|msg, wparam, _| match msg {

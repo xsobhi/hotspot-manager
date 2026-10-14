@@ -5,8 +5,10 @@
 use super::{App, HEIGHT, PAGE, WIDTH};
 use crate::hotspot::{self, Band, State, Status, BANDS};
 use crate::theme;
-use crate::wnd::{choice_index, field, place, send, set_choice, set_text, set_visible, text, Window, FIELD, LINE};
-use crate::{net, startup, worker};
+use crate::rules::Rules;
+use crate::wnd::{choice_index, enable, field, is_checked, place, send, set_checked, set_choice, set_text, set_visible,
+                text, Window, FIELD, LINE};
+use crate::{client, net, startup, worker};
 use std::cell::Cell;
 use windows::core::GUID;
 use windows::Win32::Foundation::HWND;
@@ -22,14 +24,17 @@ pub struct Settings {
     password: HWND,
     band: HWND,
     adapter: HWND,
-    adapters: Vec<(GUID, String)>,
+    adapters: Vec<(GUID, String, String)>, // id, its name in the list, Windows' name ("Wi-Fi 2")
+    five: Vec<(String, bool)>,             // which adapters' drivers can host on 5 GHz
+    band_note: HWND,
+    share: HWND,
     filled: Cell<bool>, // shown Windows' settings once (then they're the user's to edit)
 }
 
 impl Settings {
     pub fn new(window: &Window) -> Settings {
-        let adapters: Vec<(GUID, String)> = net::adapters().into_iter().filter(|a| a.wifi)
-            .map(|a| (a.id, format!("{} ({})", a.name, a.friendly))).collect();
+        let adapters: Vec<(GUID, String, String)> = net::adapters().into_iter().filter(|a| a.wifi)
+            .map(|a| (a.id, format!("{} ({})", a.name, a.friendly), a.friendly)).collect();
         let name = window.edit("", || {});
         let password = window.edit("", || {});
         send(password, EM_SETPASSWORDCHAR, DOT, 0);
@@ -43,17 +48,22 @@ impl Settings {
         let generate = window.button("Generate", move || set_text(password, &new_password()));
         let band = window.choice(&BANDS.map(|(_, name)| name), 0, |_| {});
         let mut names = vec!["Let Windows choose".to_string()];
-        names.extend(adapters.iter().map(|(_, name)| name.clone()));
+        names.extend(adapters.iter().map(|(_, name, _)| name.clone()));
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        let adapter = window.choice(&names, 0, |_| {});
+        let adapter = window.choice(&names, 0, |_| super::app().settings.explain());
+        let band_note = window.label("");
+        window.set_text_color(band_note, theme::DIM);
+        let share = window.checkbox("Share this PC's internet with the devices", true, |on| {
+            let said = if on { "The devices get the internet again." } else { "The devices reach each other and this PC, not the internet." };
+            super::app().change_rules(said, |r| r.local_only = !on);
+        });
         let sign_in = window.checkbox("Turn on automatically when I sign in", startup::enabled(), |on| {
             if !startup::set(on) {
                 super::app().say("Windows didn't let the app start at sign-in", true);
             }
         });
-        let note = window.note("Windows shares this PC's internet connection with the devices on the hotspot \
-            (up to 8). The hotspot keeps going when you close this window. Pick your USB Wi-Fi adapter to keep \
-            the PC's own Wi-Fi for its internet.");
+        let note = window.note("Up to 8 devices. The hotspot keeps going when you close this window. Pick your USB \
+            Wi-Fi adapter to keep the PC's own Wi-Fi for its internet: the others' Wi-Fi Direct is turned off for it.");
         window.set_text_color(note, theme::DIM);
         let save = window.default_button("Save", || super::app().save_settings());
         let advanced = window.button("Advanced…", || super::advanced::open(&super::app()));
@@ -63,16 +73,43 @@ impl Settings {
             place(labels[i], 24, y + (FIELD - LINE) / 2, 150, LINE);
             place(control, x, y, width, FIELD);
             y += FIELD + 14;
+            if i == 2 {
+                place(band_note, x, y - 10, WIDTH - x - 24, LINE);
+                y += LINE;
+            }
         }
         place(sign_in, x, y, 360, 26);
-        y += 26 + 14;
+        place(share, x, y + 30, 400, 26);
+        y += 56 + 14;
         place(generate, x + 310, PAGE + 22 + FIELD + 14, 100, FIELD);
         place(note, 24, y + 6, WIDTH - 48, 3 * LINE + 6);
         place(save, WIDTH - 24 - 110, HEIGHT - 24 - FIELD - 2, 110, FIELD + 2);
         place(advanced, 24, HEIGHT - 24 - FIELD - 2, 130, FIELD + 2);
-        let mut controls = vec![name, password, generate, band, adapter, sign_in, note, save, advanced];
+        let mut controls = vec![name, password, generate, band, adapter, sign_in, note, save, advanced, band_note, share];
         controls.extend(labels);
-        Settings { controls, name, password, band, adapter, adapters, filled: Cell::new(false) }
+        Settings { controls, name, password, band, adapter, adapters, five: net::hosts_on_5ghz(), band_note, share,
+                   filled: Cell::new(false) }
+    }
+
+    /// Say when the chosen adapter's driver can't host on 5 GHz.
+    fn explain(&self) {
+        let chosen = choice_index(self.adapter).checked_sub(1).and_then(|i| self.adapters.get(i)).map(|(_, _, name)| name.clone())
+            .or_else(|| net::hosting_radio().map(|a| a.friendly));
+        let no_5ghz = chosen.as_ref().is_some_and(|name| self.five.iter().any(|(n, can)| n == name && !can));
+        let text = match chosen {
+            Some(name) if no_5ghz => format!("{name}'s driver can't host on 5 GHz: the hotspot is on 2.4 GHz there."),
+            _ => String::new(),
+        };
+        set_text(self.band_note, &text);
+    }
+
+    /// Show the helper's rules ("Share internet").
+    pub fn rules(&self, rules: Option<&Rules>) {
+        enable(self.share, rules.is_some());
+        let sharing = rules.is_none_or(|r| !r.local_only);
+        if is_checked(self.share) != sharing {
+            set_checked(self.share, sharing);
+        }
     }
 
     pub fn show(&self, on: bool) {
@@ -84,8 +121,9 @@ impl Settings {
     /// Show what's saved: the adapter now, Windows' settings once they're known.
     pub fn start(&self) {
         let chosen = super::app().store.borrow().adapter_id();
-        let place = chosen.and_then(|id| self.adapters.iter().position(|(a, _)| *a == id)).map_or(0, |i| i + 1);
+        let place = chosen.and_then(|id| self.adapters.iter().position(|(a, _, _)| *a == id)).map_or(0, |i| i + 1);
         set_choice(self.adapter, place);
+        self.explain();
     }
 
     pub fn fill(&self, s: &Status) {
@@ -118,7 +156,7 @@ impl App {
             return self.say("The password needs 8 to 63 characters (English letters, digits and symbols)", true);
         }
         let band: Band = BANDS[choice_index(s.band)].0;
-        let adapter = choice_index(s.adapter).checked_sub(1).and_then(|i| s.adapters.get(i)).map(|(id, _)| *id);
+        let adapter = choice_index(s.adapter).checked_sub(1).and_then(|i| s.adapters.get(i)).map(|(id, _, _)| *id);
         let before = self.store.borrow().adapter_id();
         {
             let mut store = self.store.borrow_mut();
@@ -133,6 +171,7 @@ impl App {
         worker::run(move || {
             // Windows uses new settings when the hotspot starts: restart it if it's on
             let mut result = if was_on { hotspot::switch(before, false) } else { Ok(()) };
+            let _ = client::steer(adapter); // (on the adapter chosen; without the helper, where Windows likes)
             if !local {
                 result = result.and_then(|()| hotspot::configure(adapter, &ssid, &password, band));
             }

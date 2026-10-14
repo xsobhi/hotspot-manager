@@ -46,6 +46,11 @@ pub fn set_driver(adapter: &str, keyword: &str, value: &str) -> Result<(), Strin
     call::<bool>(json!({ "do": "set_driver", "adapter": adapter, "keyword": keyword, "value": value })).map(|_| ())
 }
 
+/// Have Windows host the hotspot on this Wi-Fi adapter (None: Windows chooses).
+pub fn steer(adapter: Option<windows::core::GUID>) -> Result<(), String> {
+    call::<bool>(json!({ "do": "steer", "adapter": adapter.map(|a| format!("{a:?}")) })).map(|_| ())
+}
+
 pub fn diagnose() -> Result<(), String> {
     call::<bool>(json!({ "do": "diagnose" })).map(|_| ())
 }

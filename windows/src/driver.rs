@@ -59,6 +59,18 @@ pub fn quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// Run a PowerShell command (no window); its output, or why it failed.
+pub fn powershell(script: &str) -> Result<String, String> {
+    let output = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000) // no console window
+        .output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).lines().find(|l| !l.trim().is_empty()).unwrap_or("PowerShell failed").to_string())
+    }
+}
+
 /// The adapter's driver settings that have a list of choices (by its description).
 pub fn properties(description: &str) -> Vec<Property> {
     let script = format!(

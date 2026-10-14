@@ -3,6 +3,7 @@
 //! come from the worker thread (worker.rs) through `post`.
 
 mod advanced;
+mod apply;
 mod device;
 mod devices;
 mod editor;
@@ -48,6 +49,7 @@ pub struct App {
     pub rules: RefCell<Option<Rules>>,                    // the helper's; None: no helper (yet)
     pub helper: RefCell<Result<HelperStatus, String>>,
     pub rates: RefCell<HashMap<String, (u64, u64, Instant, f64, f64)>>, // ip → bytes then, bits/s now
+    pub radio: RefCell<Option<String>>, // the adapter hosting the hotspot: "TP-Link (Wi-Fi 2)"
     asking: Cell<bool>,
     ticks: Cell<u64>,
     top: top::Top,
@@ -73,9 +75,11 @@ impl App {
         worker::run(move || {
             let status = hotspot::status(adapter);
             let helper = client::status();
+            let radio = net::hosting_radio().map(|a| format!("{} ({})", a.name.split_whitespace().next().unwrap_or(""), a.friendly));
             let rules = if need_rules && helper.is_ok() { client::rules().ok() } else { None };
             post(move |app| {
                 app.asking.set(false);
+                *app.radio.borrow_mut() = radio;
                 if rules.is_some() {
                     *app.rules.borrow_mut() = rules;
                 }
@@ -122,6 +126,7 @@ impl App {
     pub fn update(&self) {
         self.top.update(self);
         self.devices.update(self);
+        self.settings.rules(self.rules.borrow().as_ref());
     }
 
     pub fn state(&self) -> Option<State> {
