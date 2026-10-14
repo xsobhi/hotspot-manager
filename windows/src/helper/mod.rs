@@ -42,6 +42,7 @@ pub struct Shared {
     pub problem: String,                 // why the traffic engine isn't working, if it isn't
     pub hosting: Option<Instant>,        // when the app's own hotspot last said it's on (own.rs)
     pub counts: [engine::Counts; 2],     // what the engine did with the packets [up, down]
+    pub translations: engine::Translations, // whose uploads Windows' sharing translated
 }
 
 impl Shared {
@@ -88,6 +89,7 @@ struct Running {
     gateway: Ip,
     hotspot: u32,
     own: bool, // the app's own hotspot (own.rs)
+    internet: Option<u32>, // where the internet goes out (the engine holds the uploads there)
     engine: Option<Engine>,
     dhcp: Option<dhcpd::DhcpServer>,
 }
@@ -140,7 +142,9 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>, own: bool)
     // the hotspot's address is the one Windows gave it (one asked for applies once Windows takes it)
     let gateway = adapter.as_ref().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
         .unwrap_or_else(net::gateway);
-    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway && r.own == own;
+    let internet = net::internet_index();
+    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway && r.own == own
+        && r.internet == internet;
     if running.as_ref().is_some_and(|r| !same(r)) {
         running.take().unwrap().stop();
         log::line("The hotspot is off");
@@ -149,13 +153,13 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>, own: bool)
     let own_dhcp = own || shared.lock().unwrap().rules.network.own_dhcp();
     let r = running.get_or_insert_with(|| {
         log::line(format!("The hotspot is on: {} ({})", adapter.friendly, adapter.name));
-        let engine = Engine::start(shared.clone(), gateway);
+        let engine = Engine::start(shared.clone(), gateway, internet);
         let mut s = shared.lock().unwrap();
         s.problem = engine.as_ref().err().cloned().unwrap_or_default();
         if !s.problem.is_empty() {
             log::line(format!("Can't count or limit traffic: {}", s.problem));
         }
-        Running { gateway, hotspot: adapter.index, own, engine: engine.ok(), dhcp: None }
+        Running { gateway, hotspot: adapter.index, own, internet, engine: engine.ok(), dhcp: None }
     });
     if own_dhcp != r.dhcp.is_some() {
         if let Some(d) = r.dhcp.take() {
