@@ -53,7 +53,8 @@ fn show(app: &Rc<App>, found: Found) {
     let isolate = window.checkbox("Stop connected devices from seeing each other", rules.as_ref().is_some_and(|r| r.isolate), |_| {});
     let windows_note = dim("Windows' hotspot takes the country from Windows' region, can't hide its name, and takes up to 8 devices.");
     let network = heading("Network");
-    let network_note = dim("Devices get an address from the DHCP range, with the hotspot IP as their gateway.");
+    let network_note = dim("Devices get an address from the DHCP range, with the hotspot IP as their gateway. Windows' \
+        own hotspot is always at 192.168.137.1: at another address, this app hosts it itself.");
     let range = |n: u8| ip_text([gateway[0], gateway[1], gateway[2], n]);
     let (from, to) = (window.edit(&range(net_rules.dhcp_from), || {}), window.edit(&range(net_rules.dhcp_to), || {}));
     let me = Rc::new(Cell::new(HWND::default()));
@@ -69,10 +70,10 @@ fn show(app: &Rc<App>, found: Found) {
         }
     });
     me.set(gw);
-    // Windows' hotspot may keep its own address (192.168.137.1) until the PC restarts
+    // (Windows' own hotspot, turned on elsewhere, stays at 192.168.137.1)
     let now_at = net::hotspot_adapter().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
         .filter(|ip| *ip != gateway);
-    let kept = dim(&now_at.map(|ip| format!("Windows is keeping the hotspot at {} for now: {} may need the PC to restart.",
+    let kept = dim(&now_at.map(|ip| format!("The hotspot is at {} now: it moves to {} when it's turned off and on here.",
                                             ip_text(ip), ip_text(gateway))).unwrap_or_default());
     window.set_text_color(kept, theme::DANGER);
     let to_word = window.label("to");
@@ -139,8 +140,8 @@ fn show(app: &Rc<App>, found: Found) {
     place(windows_note, X, y, WIDTH - X - 20, 2 * LINE + 4);
     y += 2 * LINE + 18;
     place(network, 20, y, 200, 22);
-    place(network_note, 20, y + 24, WIDTH - 40, LINE + 4);
-    y += 52;
+    place(network_note, 20, y + 24, WIDTH - 40, 2 * LINE + 4);
+    y += 52 + LINE;
     row("Hotspot IP (gateway)", gw, 180, &mut y);
     if now_at.is_some() {
         place(kept, X, y - 6, WIDTH - X - 20, 2 * LINE + 4);

@@ -87,20 +87,26 @@ pub fn online() -> bool {
     NetworkInformation::GetInternetConnectionProfile().is_ok()
 }
 
-/// The local-only hotspot's state, and the devices on it (from Windows' neighbour table).
-fn local_status() -> Status {
+/// Is the hotspot at an address of the user's? Windows' own stays at 192.168.137.1, so then the app
+/// hosts it itself (local.rs) and the helper shares the internet (helper/own.rs).
+pub fn own_address() -> bool {
+    net::gateway() != [192, 168, 137, 1]
+}
+
+/// The app's own hotspot's state (local.rs), and the devices on it (from Windows' neighbour table).
+fn local_status(band: Band) -> Status {
     let store = Store::load();
     let on = local::running();
     let clients = net::hotspot_adapter().filter(|_| on).map(|a| net::neighbors(a.index)).unwrap_or_default()
         .into_iter().map(|(ip, mac)| Client { mac, host: None, ip: Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])) })
         .collect();
-    Status { state: if on { State::On } else { State::Off }, ssid: store.ssid, passphrase: store.passphrase, band: Band::Any,
-             clients, max_clients: 8, local: true }
+    Status { state: if on { State::On } else { State::Off }, ssid: store.ssid, passphrase: store.passphrase, band,
+             clients, max_clients: 8, local: !online() }
 }
 
 pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
     if local::running() || !online() {
-        return Ok(local_status());
+        return Ok(local_status(Band::Any));
     }
     let m = manager(adapter)?;
     let state = match m.TetheringOperationalState() {
@@ -115,6 +121,9 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
         Ok(TetheringWiFiBand::FiveGigahertz) => Band::Five,
         _ => Band::Any,
     };
+    if state == State::Off && own_address() {
+        return Ok(local_status(band)); // (turning it on starts the app's own)
+    }
     Ok(Status {
         state,
         ssid: config.Ssid().map(|s| s.to_string()).unwrap_or_default(),
@@ -162,12 +171,13 @@ fn clients(m: &NetworkOperatorTetheringManager) -> Vec<Client> {
 
 /// Turn the hotspot on or off.
 pub fn switch(adapter: Option<GUID>, on: bool) -> Result<(), String> {
-    // without internet to share: the local-only hotspot (Windows' own won't start)
+    // the app's own hotspot: without internet to share (Windows' own won't start), or at an
+    // address of the user's (Windows' own stays at 192.168.137.1)
     if !on && local::running() {
         local::stop();
         return Ok(());
     }
-    if on && !online() {
+    if on && (!online() || own_address()) {
         return local::start();
     }
     let m = manager(adapter)?;

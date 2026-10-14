@@ -69,12 +69,13 @@ pub struct Adapter {
     pub up: bool,
     pub wifi: bool, // a Wi-Fi adapter itself (not Windows' virtual ones on it)
     pub ipv4: Vec<[u8; 4]>,
+    pub dns: Vec<[u8; 4]>, // its DNS servers (IPv4)
     pub mac: [u8; 6],
 }
 
 /// Every network adapter, with its addresses.
 pub fn adapters() -> Vec<Adapter> {
-    let flags = GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST;
+    let flags = GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST;
     let mut size = 16 * 1024u32;
     let mut buffer: Vec<u64> = vec![];
     // SAFETY: Windows fills our buffer (8-byte aligned), asking for a bigger one when needed
@@ -96,15 +97,23 @@ pub fn adapters() -> Vec<Adapter> {
         while let Some(a) = next.as_ref() {
             let id = a.AdapterName.to_string().ok()
                 .and_then(|n| GUID::try_from(n.trim_matches(|c| c == '{' || c == '}')).ok());
-            let mut ipv4 = vec![];
+            let v4 = |address: &SOCKET_ADDRESS| {
+                let sockaddr = address.lpSockaddr;
+                (!sockaddr.is_null() && (*sockaddr).sa_family == AF_INET).then(|| {
+                    let b = (*(sockaddr as *const SOCKADDR_IN)).sin_addr.S_un.S_un_b;
+                    [b.s_b1, b.s_b2, b.s_b3, b.s_b4]
+                })
+            };
+            let (mut ipv4, mut dns) = (vec![], vec![]);
             let mut address = a.FirstUnicastAddress;
             while let Some(u) = address.as_ref() {
-                let sockaddr = u.Address.lpSockaddr;
-                if !sockaddr.is_null() && (*sockaddr).sa_family == AF_INET {
-                    let b = (*(sockaddr as *const SOCKADDR_IN)).sin_addr.S_un.S_un_b;
-                    ipv4.push([b.s_b1, b.s_b2, b.s_b3, b.s_b4]);
-                }
+                ipv4.extend(v4(&u.Address));
                 address = u.Next;
+            }
+            let mut server = a.FirstDnsServerAddress;
+            while let Some(d) = server.as_ref() {
+                dns.extend(v4(&d.Address));
+                server = d.Next;
             }
             if let Some(id) = id {
                 list.push(Adapter {
@@ -115,6 +124,7 @@ pub fn adapters() -> Vec<Adapter> {
                     up: a.OperStatus == IfOperStatusUp,
                     wifi: a.IfType == IF_TYPE_IEEE80211 && !virtual_adapter(&a.Description.to_string().unwrap_or_default()),
                     ipv4,
+                    dns,
                     mac: a.PhysicalAddress[..6].try_into().unwrap_or_default(),
                 });
             }
@@ -122,6 +132,20 @@ pub fn adapters() -> Vec<Adapter> {
         }
     }
     list
+}
+
+/// The adapter the PC's internet goes out of (its index), if it's online.
+pub fn internet_index() -> Option<u32> {
+    let mut index = 0;
+    // SAFETY: Windows writes one number
+    let found = unsafe { GetBestInterface(u32::from_ne_bytes([1, 1, 1, 1]), &mut index) };
+    (found == NO_ERROR.0 && index != 0).then_some(index)
+}
+
+/// The DNS servers the PC's internet connection uses (for devices that can't ask the PC).
+pub fn internet_dns() -> Option<[u8; 4]> {
+    let index = internet_index()?;
+    adapters().into_iter().find(|a| a.index == index)?.dns.into_iter().next()
 }
 
 fn virtual_adapter(description: &str) -> bool {

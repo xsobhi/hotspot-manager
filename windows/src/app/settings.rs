@@ -46,7 +46,7 @@ impl Settings {
         });
         field::make_field(password, vec![eye]);
         let generate = window.button("Generate", move || set_text(password, &new_password()));
-        let band = window.choice(&BANDS.map(|(_, name)| name), 0, |_| {});
+        let band = window.choice(&BANDS.map(|(_, name)| name), 0, |_| super::app().settings.explain());
         let mut names = vec!["Let Windows choose".to_string()];
         names.extend(adapters.iter().map(|(_, name, _)| name.clone()));
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -91,14 +91,24 @@ impl Settings {
                    filled: Cell::new(false) }
     }
 
-    /// Say when the chosen adapter's driver can't host on 5 GHz.
+    /// Say what decides the band on the chosen adapter (its driver's Wireless Mode, apply.rs).
     fn explain(&self) {
-        let chosen = choice_index(self.adapter).checked_sub(1).and_then(|i| self.adapters.get(i)).map(|(_, _, name)| name.clone())
-            .or_else(|| net::hosting_radio().map(|a| a.friendly));
-        let no_5ghz = chosen.as_ref().is_some_and(|name| self.five.iter().any(|(n, can)| n == name && !can));
+        let band = BANDS[choice_index(self.band)].0;
+        let chosen = choice_index(self.adapter).checked_sub(1).and_then(|i| self.adapters.get(i));
         let text = match chosen {
-            Some(name) if no_5ghz => format!("{name}'s driver can't host on 5 GHz: the hotspot is on 2.4 GHz there."),
-            _ => String::new(),
+            None => String::new(),
+            Some((id, _, name)) if Some(*id) == hotspot::internet_adapter() => match band {
+                Band::Any => String::new(),
+                _ => format!("{name} is this PC's internet connection too: Windows picks the band."),
+            },
+            Some((_, _, name)) => match band {
+                Band::Five => format!("{name} is switched to 5 GHz only for it (its driver's Wireless Mode)."),
+                Band::TwoPointFour => format!("{name} is switched to 2.4 GHz only for it (its driver's Wireless Mode)."),
+                Band::Any if self.five.iter().any(|(n, can)| n == name && !can) => {
+                    format!("{name}'s driver hosts on 2.4 GHz unless the band is set to 5 GHz.")
+                }
+                Band::Any => String::new(),
+            },
         };
         set_text(self.band_note, &text);
     }
@@ -133,6 +143,7 @@ impl Settings {
         set_text(self.name, &s.ssid);
         set_text(self.password, &s.passphrase);
         set_choice(self.band, BANDS.iter().position(|(b, _)| *b == s.band).unwrap_or(0));
+        self.explain();
     }
 }
 
@@ -172,6 +183,14 @@ impl App {
             // Windows uses new settings when the hotspot starts: restart it if it's on
             let mut result = if was_on { hotspot::switch(before, false) } else { Ok(()) };
             let _ = client::steer(adapter); // (on the adapter chosen; without the helper, where Windows likes)
+            // the band, through the adapter's driver (5 GHz: Windows' Wi-Fi Direct needs it kept there)
+            if let Some(id) = adapter {
+                match super::apply::keep_to_band(id, band) {
+                    Ok(true) => super::apply::settled(id),
+                    Ok(false) => {}
+                    Err(why) => result = result.and(Err(why)),
+                }
+            }
             if !local {
                 result = result.and_then(|()| hotspot::configure(adapter, &ssid, &password, band));
             }
