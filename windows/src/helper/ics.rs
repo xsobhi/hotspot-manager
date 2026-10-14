@@ -6,6 +6,7 @@ use crate::helper::dhcp::Ip;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_SZ};
+use windows::Win32::System::Services::*;
 
 const KEY: PCWSTR = w!(r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters");
 
@@ -25,5 +26,30 @@ pub fn set_gateway(ip: Ip) -> Result<(), String> {
             return Err("Windows didn't let the helper change the hotspot's address".into());
         }
     }
+    restart_sharing();
     Ok(())
+}
+
+/// Internet Connection Sharing reads the address when it starts: restart it (if it's running;
+/// the hotspot should be off meanwhile).
+fn restart_sharing() {
+    // SAFETY: Windows' service manager, on the SharedAccess service; handles closed at the end
+    unsafe {
+        let Ok(manager) = OpenSCManagerW(None, None, SC_MANAGER_CONNECT) else { return };
+        if let Ok(service) = OpenServiceW(manager, w!("SharedAccess"), SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS) {
+            let mut status = SERVICE_STATUS::default();
+            if ControlService(service, SERVICE_CONTROL_STOP, &mut status).is_ok() {
+                for _ in 0..50 {
+                    let _ = QueryServiceStatus(service, &mut status);
+                    if status.dwCurrentState == SERVICE_STOPPED {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                let _ = StartServiceW(service, None);
+            }
+            let _ = CloseServiceHandle(service);
+        }
+        let _ = CloseServiceHandle(manager);
+    }
 }

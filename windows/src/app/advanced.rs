@@ -161,9 +161,11 @@ fn move_hotspot(app: &Rc<App>, gateway: [u8; 4]) {
     app.busy.set(Some("Moving the hotspot…"));
     app.update();
     worker::run(move || {
-        let mut result = client::set_gateway(&ip_text(gateway));
+        // off, the new address (Windows' sharing restarts with it), on again
+        let mut result = if was_on { hotspot::switch(adapter, false) } else { Ok(()) };
+        result = result.and_then(|()| client::set_gateway(&ip_text(gateway)));
         if was_on && result.is_ok() {
-            result = hotspot::switch(adapter, false).and_then(|()| hotspot::switch(adapter, true));
+            result = hotspot::switch(adapter, true);
         }
         super::post(move |app| {
             app.busy.set(None);
