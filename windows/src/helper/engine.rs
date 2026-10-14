@@ -14,6 +14,20 @@ use std::time::{Duration, Instant};
 
 type Packet = (Vec<u8>, Address);
 
+/// Ahead of Windows' sharing: it translates the devices' uploads where WinDivert sees them and
+/// sends its own copy on, so the engine has to have them first (downloads come translated already).
+const PRIORITY: i16 = 30000; // WINDIVERT_PRIORITY_HIGHEST
+
+/// What the engine did with the packets in one direction, for the diagnosis.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Counts {
+    pub seen: u64,
+    pub sent: u64,     // on at once
+    pub queued: u64,   // waiting for the speed limit
+    pub dropped: u64,  // the queue was full, or the device may not
+    pub released: u64, // let out of the queue
+}
+
 /// The speed-limit queues: one per device and direction, and the whole hotspot's caps.
 #[derive(Default)]
 pub struct Lanes {
@@ -43,7 +57,7 @@ impl Engine {
         let net = format!("{}.{}.{}", gateway[0], gateway[1], gateway[2]);
         let filter = format!("ip and ((ip.SrcAddr >= {net}.0 and ip.SrcAddr <= {net}.255) or \
                               (ip.DstAddr >= {net}.0 and ip.DstAddr <= {net}.255))");
-        let divert = Arc::new(Divert::open(&filter, LAYER_FORWARD, 0)?);
+        let divert = Arc::new(Divert::open(&filter, LAYER_FORWARD, PRIORITY)?);
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (divert.clone(), shared.clone());
         let capture = std::thread::spawn(move || {
@@ -60,7 +74,8 @@ impl Engine {
             while !st.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(2));
                 {
-                    let mut shared = s.lock().unwrap();
+                    let mut guard = s.lock().unwrap();
+                    let shared = &mut *guard; // (its fields borrowed apart)
                     let lanes = &mut shared.lanes;
                     let now = Instant::now();
                     let count = lanes.lanes.len();
@@ -69,7 +84,9 @@ impl Engine {
                         let i = (k + lanes.turn) % count;
                         let ((_, down), lane) = &mut lanes.lanes[i];
                         if lane.waiting() {
+                            let before = out.len();
                             lane.release(lanes.totals[*down as usize].as_mut(), now, &mut out);
+                            shared.counts[*down as usize].released += (out.len() - before) as u64;
                         }
                     }
                 }
@@ -114,7 +131,11 @@ fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) 
     if device == gateway || device[3] == 255 {
         return Some((packet, address));
     }
+    let s = &mut *s; // (its fields borrowed apart)
+    let counts = &mut s.counts[down as usize];
+    counts.seen += 1;
     if s.rules.local_only {
+        counts.dropped += 1;
         return None; // "Share internet" is off: the devices only reach each other and the PC
     }
     let used = s.usage.entry(device).or_default();
@@ -122,12 +143,15 @@ fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) 
     let mac = s.macs.get(&device).cloned();
     if let Some(mac) = &mac
         && !s.let_through(mac) {
+        s.counts[down as usize].dropped += 1;
         return None;
     }
+    let counts = &mut s.counts[down as usize];
     let limit = mac.as_deref().map_or(s.rules.everyone, |m| s.rules.limit_for(m));
     let wanted = shape::direction(&limit, down);
     let total = if down { s.rules.total.down } else { s.rules.total.up };
     if wanted.0 == 0 && total == 0 {
+        counts.sent += 1;
         return Some((packet, address));
     }
     let now = Instant::now();
@@ -143,6 +167,12 @@ fn handle(shared: &Mutex<Shared>, packet: &[u8], address: Address, gateway: Ip) 
     if lane.limit != wanted {
         *lane = Lane::new(wanted, now);
     }
-    let size = packet.len();
-    lane.offer((packet, address), size, lanes.totals[down as usize].as_mut(), now)
+    let (size, waiting) = (packet.len(), lane.waiting_count());
+    let offered = lane.offer((packet, address), size, lanes.totals[down as usize].as_mut(), now);
+    match (&offered, lane.waiting_count() > waiting) {
+        (Some(_), _) => counts.sent += 1,
+        (None, true) => counts.queued += 1,
+        (None, false) => counts.dropped += 1,
+    }
+    offered
 }

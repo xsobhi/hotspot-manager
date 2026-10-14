@@ -11,6 +11,7 @@ mod divert;
 mod engine;
 mod ics;
 pub mod log;
+mod own;
 mod pipe;
 mod requests;
 pub mod service;
@@ -26,7 +27,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What the helper's threads share.
 #[derive(Default)]
@@ -39,6 +40,8 @@ pub struct Shared {
     pub online: Vec<String>,             // devices on it now, in the order they came
     pub hosts: HashMap<String, String>,  // MAC → the name it gave DHCP
     pub problem: String,                 // why the traffic engine isn't working, if it isn't
+    pub hosting: Option<Instant>,        // when the app's own hotspot last said it's on (own.rs)
+    pub counts: [engine::Counts; 2],     // what the engine did with the packets [up, down]
 }
 
 impl Shared {
@@ -84,6 +87,7 @@ pub fn shared() -> &'static Arc<Mutex<Shared>> {
 struct Running {
     gateway: Ip,
     hotspot: u32,
+    own: bool, // the app's own hotspot (own.rs)
     engine: Option<Engine>,
     dhcp: Option<dhcpd::DhcpServer>,
 }
@@ -106,9 +110,12 @@ pub fn run(stop: &AtomicBool) {
     log::line(format!("Helper started (version {})", env!("CARGO_PKG_VERSION")));
     let shared = shared().clone();
     std::thread::spawn(pipe::serve);
-    let mut running: Option<Running> = None;
+    own::leftovers();
+    let (mut running, mut own): (Option<Running>, Option<own::Own>) = (None, None);
     while !stop.load(Ordering::Relaxed) {
-        upkeep(&shared, &mut running);
+        let hosting = shared.lock().unwrap().hosting.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+        own::follow(hosting, &mut own);
+        upkeep(&shared, &mut running, own.as_ref().is_some_and(own::Own::needs_dhcp));
         for _ in 0..20 {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -119,11 +126,13 @@ pub fn run(stop: &AtomicBool) {
     if let Some(r) = running.take() {
         r.stop();
     }
+    own::follow(false, &mut own);
     log::line("Helper stopped");
 }
 
 /// Every two seconds: follow the hotspot (on, off, its adapter), who's on it, and the rules.
-fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
+/// `own`: it's the app's own hotspot without Windows' sharing (own.rs): no Windows DHCP there.
+fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>, own: bool) {
     let adapter = net::hotspot_adapter();
     if let Some(a) = &adapter {
         tidy(a);
@@ -131,13 +140,13 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     // the hotspot's address is the one Windows gave it (one asked for applies once Windows takes it)
     let gateway = adapter.as_ref().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
         .unwrap_or_else(net::gateway);
-    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway;
+    let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway && r.own == own;
     if running.as_ref().is_some_and(|r| !same(r)) {
         running.take().unwrap().stop();
         log::line("The hotspot is off");
     }
     let Some(adapter) = adapter else { return };
-    let own_dhcp = shared.lock().unwrap().rules.network.own_dhcp();
+    let own_dhcp = own || shared.lock().unwrap().rules.network.own_dhcp();
     let r = running.get_or_insert_with(|| {
         log::line(format!("The hotspot is on: {} ({})", adapter.friendly, adapter.name));
         let engine = Engine::start(shared.clone(), gateway);
@@ -146,13 +155,15 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
         if !s.problem.is_empty() {
             log::line(format!("Can't count or limit traffic: {}", s.problem));
         }
-        Running { gateway, hotspot: adapter.index, engine: engine.ok(), dhcp: None }
+        Running { gateway, hotspot: adapter.index, own, engine: engine.ok(), dhcp: None }
     });
     if own_dhcp != r.dhcp.is_some() {
         if let Some(d) = r.dhcp.take() {
             d.stop();
         } else {
-            match dhcpd::DhcpServer::start(shared.clone(), gateway, gateway, adapter.index) {
+            // the DNS server: Windows' sharing answers at the hotspot's address; without it, the PC's own
+            let dns = if own { net::internet_dns().unwrap_or([1, 1, 1, 1]) } else { gateway };
+            match dhcpd::DhcpServer::start(shared.clone(), gateway, dns, adapter.index) {
                 Ok(d) => r.dhcp = Some(d),
                 Err(e) => log::line(format!("Can't give out addresses: {e}")),
             }

@@ -19,6 +19,7 @@ pub enum Request {
     SetDriver { adapter: String, keyword: String, value: String },
     Steer { adapter: Option<String> },
     Diagnose,
+    Hosting { on: bool }, // the app's own hotspot is on (said every few seconds) or off
 }
 
 pub fn answer(line: &str) -> String {
@@ -35,6 +36,10 @@ pub fn answer(line: &str) -> String {
 fn handle(request: Request) -> Result<Value, String> {
     let shared = shared();
     match request {
+        Request::Hosting { on } => {
+            shared.lock().unwrap().hosting = on.then(std::time::Instant::now);
+            Ok(json!(true))
+        }
         Request::Status => {
             let s = shared.lock().unwrap();
             let usage = s.usage.iter().map(|(ip, (down, up))| Usage {

@@ -123,6 +123,10 @@ impl<P> Lane<P> {
     pub fn waiting(&self) -> bool {
         !self.queue.is_empty()
     }
+
+    pub fn waiting_count(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 /// The (kbit/s, burst, seconds) of a limit in one direction (`down`: to the device).

@@ -51,6 +51,12 @@ pub fn steer(adapter: Option<windows::core::GUID>) -> Result<(), String> {
     call::<bool>(json!({ "do": "steer", "adapter": adapter.map(|a| format!("{a:?}")) })).map(|_| ())
 }
 
+/// The app's own hotspot is on (local.rs says so every few seconds) or off: the helper gives it
+/// its address and shares the internet (helper/own.rs).
+pub fn hosting(on: bool) -> Result<(), String> {
+    call::<bool>(json!({ "do": "hosting", "on": on })).map(|_| ())
+}
+
 pub fn diagnose() -> Result<(), String> {
     call::<bool>(json!({ "do": "diagnose" })).map(|_| ())
 }

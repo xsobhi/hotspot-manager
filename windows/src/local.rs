@@ -4,9 +4,14 @@
 //! the local network, sharing files), not the internet. Windows' own mobile hotspot won't start
 //! without a connection to share.
 //!
+//! It's also the hotspot at an address of the user's (Windows' own stays at 192.168.137.1): it
+//! tells the helper it's on, every few seconds, and the helper gives it the address, the devices'
+//! addresses and the internet (helper/own.rs).
+//!
 //! It runs in a background process (`hotspot-manager --local-hotspot`) so it stays on when the
 //! window closes; the window starts it and tells it to stop.
 
+use crate::client;
 use crate::store::Store;
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -95,16 +100,22 @@ pub fn serve() -> i32 {
         Ok(p) => p,
         Err(e) => return fail(format!("Windows couldn't start the local hotspot: {}", e.message())),
     };
-    // wait until Windows has it up, then until told to stop (or Windows stops it)
-    loop {
+    // wait until Windows has it up, then until told to stop (or Windows stops it); meanwhile the
+    // helper hears it's on (without the helper: no address of the user's, no internet)
+    for second in 0u64.. {
+        if second % 3 == 0 {
+            let _ = client::hosting(true);
+        }
         // SAFETY: our event
         let told = unsafe { WaitForSingleObject(stop, 1000) } == windows::Win32::Foundation::WAIT_OBJECT_0;
         let status = publisher.Status().unwrap_or(WiFiDirectAdvertisementPublisherStatus::Aborted);
         if told || status == WiFiDirectAdvertisementPublisherStatus::Aborted || status == WiFiDirectAdvertisementPublisherStatus::Stopped {
             let _ = publisher.Stop();
-            return if told { 0 } else { fail("Windows stopped the local hotspot (is Wi-Fi on?)".into()) };
+            let _ = client::hosting(false);
+            return if told { 0 } else { fail("Windows stopped the hotspot (is Wi-Fi on?)".into()) };
         }
     }
+    0
 }
 
 /// Windows' Wi-Fi Direct, as an access point with this name and password.
