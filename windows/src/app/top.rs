@@ -1,7 +1,8 @@
 //! The top of the window: the hotspot's state in words, how many devices are on it and how
 //! fast it's going, its switch, and the QR code to join it.
 
-use super::{qr, started, App, TOP, WIDTH};
+use super::{post, qr, started, App, TOP, WIDTH};
+use crate::{hotspot, worker};
 use crate::hotspot::State;
 use crate::theme::{self, Align, Font, Painter};
 use crate::wnd::{canvas, enable, is_checked, place, px, set_checked, Window};
@@ -88,4 +89,25 @@ fn paint(p: &Painter, app: &App) {
         _ => (String::new(), theme::DIM),
     };
     p.text(text(TOP / 2 + 2, TOP / 2 + 26), &line, Font::Body, line_color, Align::Left);
+}
+
+impl App {
+    /// The switch: turn the hotspot on or off.
+    pub fn turn(&self, on: bool) {
+        self.busy.set(Some(if on { "Turning on…" } else { "Turning off…" }));
+        self.update();
+        let adapter = self.store.borrow().adapter_id();
+        worker::run(move || {
+            let result = hotspot::switch(adapter, on);
+            post(move |app| {
+                app.busy.set(None);
+                match result {
+                    Ok(()) if on => app.say("The hotspot is on. It stays on when you close this window.", false),
+                    Ok(()) => app.say("The hotspot is off.", false),
+                    Err(why) => app.say(why, true),
+                }
+                app.refresh();
+            });
+        });
+    }
 }

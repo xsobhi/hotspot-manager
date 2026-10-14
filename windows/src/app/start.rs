@@ -49,7 +49,9 @@ pub fn post(job: impl FnOnce(&Rc<App>) + Send + 'static) {
 pub fn run() -> i32 {
     // SAFETY: looking for our own window; bringing it forward
     unsafe {
-        if let Ok(open) = FindWindowW(wnd::CLASS, w!("Hotspot Manager")) {
+        // (a build tried with its own HOTSPOT_HOME runs beside the installed app)
+        let found = std::env::var_os("HOTSPOT_HOME").is_none().then(|| FindWindowW(wnd::CLASS, w!("Hotspot Manager")).ok()).flatten();
+        if let Some(open) = found {
             let _ = ShowWindow(open, SW_RESTORE);
             let _ = SetForegroundWindow(open);
             return 0;
@@ -74,7 +76,8 @@ pub fn run() -> i32 {
     let this = Rc::new(App {
         window: window.clone(), store: RefCell::new(Store::load()), status: RefCell::default(), busy: Cell::default(),
         note: RefCell::default(), speed: Cell::default(), traffic: Cell::default(), asking: Cell::new(false),
-        ticks: Cell::new(0), top, devices, settings,
+        ticks: Cell::new(0), top, devices, settings, rules: RefCell::default(),
+        helper: RefCell::new(Err(String::new())), rates: RefCell::default(),
     });
     APP.with(|a| { let _ = a.set(this.clone()); });
     window.hook(|msg, wparam, _| match msg {

@@ -1,7 +1,7 @@
 //! Windows' buttons and check boxes drawn the way GTK draws them on Linux Mint (Mint-Y): flat,
 //! a 1-pixel border, small corners; the main button, ticked boxes and switches in Mint's green.
 
-use super::look::{marked, DROPDOWN, FLAT, ICON, PRIMARY, SWITCH};
+use super::look::{marked, DANGER, DROPDOWN, FLAT, ICON, PRIMARY, SWITCH};
 use super::{px, send, text};
 use crate::theme::{self, Font, Painter, ACCENT, RADIUS, WHITE};
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
@@ -45,9 +45,10 @@ fn push(p: &Painter, d: &NMCUSTOMDRAW, behind: COLORREF) {
     let (fill, border, color) = if marked(hwnd, FLAT) {
         let fill = if down { Some(theme::pressed(behind)) } else if hot { Some(theme::hover(behind)) } else { None };
         (fill, None, if disabled { theme::DISABLED } else { theme::TEXT })
-    } else if marked(hwnd, PRIMARY) && !disabled {
-        let fill = if down { darker(ACCENT, 0.12) } else if hot { theme::mix(ACCENT, WHITE, 0.12) } else { ACCENT };
-        (Some(fill), Some(darker(ACCENT, 0.12)), WHITE)
+    } else if (marked(hwnd, PRIMARY) || marked(hwnd, DANGER)) && !disabled {
+        let base = if marked(hwnd, DANGER) { theme::DANGER } else { ACCENT };
+        let fill = if down { darker(base, 0.12) } else if hot { theme::mix(base, WHITE, 0.12) } else { base };
+        (Some(fill), Some(darker(base, 0.12)), WHITE)
     } else if disabled {
         (Some(theme::mix(theme::BUTTON, behind, 0.5)), Some(theme::mix(theme::BUTTON_BORDER, behind, 0.5)), theme::DISABLED)
     } else {

@@ -85,19 +85,6 @@ impl Store {
     }
 }
 
-impl Device {
-    /// What to call it: its given name, the name it gave, or its maker's kind of address.
-    pub fn title(&self, mac: &str) -> String {
-        if !self.name.trim().is_empty() {
-            return self.name.trim().to_string();
-        }
-        if !self.host.trim().is_empty() {
-            return self.host.trim().to_string();
-        }
-        if random_mac(mac) { "Device with a private address".into() } else { "Unknown device".into() }
-    }
-}
-
 /// Phones use a made-up ("private") address per network: its second digit is 2, 6, A or E.
 pub fn random_mac(mac: &str) -> bool {
     mac.chars().nth(1).is_some_and(|c| matches!(c.to_ascii_lowercase(), '2' | '6' | 'a' | 'e'))

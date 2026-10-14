@@ -8,13 +8,15 @@ mod class;
 mod controls;
 pub mod field;
 mod frame;
-mod labels;
+mod inputs;
+pub mod labels;
 mod layout;
 pub mod look;
 pub mod moves;
 pub mod tabs;
 
 pub use controls::*;
+pub use inputs::*;
 pub use layout::*;
 pub use field::{enable, set_visible};
 pub use moves::batch;

@@ -1,0 +1,190 @@
+//! Speed limits as Linux's tc does them for the Linux app: a token bucket per device and
+//! direction (HTB-like lanes, so each device gets its own speed), a second, faster bucket for
+//! short bursts (TBF's peak rate), and one more for the whole hotspot. Packets over the limit
+//! wait in a short queue; when that's full they're dropped, which is how TCP learns to slow down.
+
+use crate::rules::Limit;
+use std::collections::VecDeque;
+use std::time::Instant;
+
+const MTU: f64 = 1514.0;
+const QUEUE_PACKETS: usize = 300;
+const QUEUE_BYTES: usize = 512 * 1024;
+
+/// Bytes a second from kbit/s.
+fn bytes(kbit: u32) -> f64 {
+    kbit as f64 * 1000.0 / 8.0
+}
+
+#[derive(Clone, Debug)]
+pub struct Bucket {
+    rate: f64, // bytes a second
+    size: f64,
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    pub fn new(rate: f64, size: f64, now: Instant) -> Bucket {
+        Bucket { rate, size, tokens: size, at: now }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let seconds = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + seconds * self.rate).min(self.size);
+        self.at = now;
+    }
+
+    fn has(&mut self, n: f64, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= n
+    }
+
+    fn take(&mut self, n: f64) {
+        self.tokens -= n;
+    }
+}
+
+/// The buckets for a speed limit in one direction: (sustained, peak while bursting); none for
+/// no limit.
+pub fn buckets(rate_kbit: u32, burst_kbit: u32, burst_secs: u32, now: Instant) -> (Option<Bucket>, Option<Bucket>) {
+    if rate_kbit == 0 {
+        return (None, None);
+    }
+    let rate = bytes(rate_kbit);
+    let smooth = (rate * 0.03).max(2.0 * MTU); // 30 ms of it: no stutter, no burst
+    if burst_kbit > rate_kbit {
+        let peak = bytes(burst_kbit);
+        let extra = (peak - rate) * burst_secs.max(1) as f64; // what the burst lets through on top
+        (Some(Bucket::new(rate, smooth + extra, now)), Some(Bucket::new(peak, (peak * 0.03).max(2.0 * MTU), now)))
+    } else {
+        (Some(Bucket::new(rate, smooth, now)), None)
+    }
+}
+
+/// One device's traffic in one direction, under its limit.
+pub struct Lane<P> {
+    pub limit: (u32, u32, u32), // (kbit/s, burst kbit/s, burst seconds): to notice changes
+    rate: Option<Bucket>, // none: only the whole hotspot's cap applies
+    peak: Option<Bucket>,
+    queue: VecDeque<(P, usize)>,
+    queued: usize,
+}
+
+impl<P> Lane<P> {
+    pub fn new(limit: (u32, u32, u32), now: Instant) -> Lane<P> {
+        let (rate, peak) = buckets(limit.0, limit.1, limit.2, now);
+        Lane { limit, rate, peak, queue: VecDeque::new(), queued: 0 }
+    }
+
+    fn fits(&mut self, n: usize, now: Instant) -> bool {
+        let n = n as f64;
+        self.rate.as_mut().is_none_or(|r| r.has(n, now)) && self.peak.as_mut().is_none_or(|p| p.has(n, now))
+    }
+
+    fn spend(&mut self, n: usize) {
+        for bucket in [&mut self.rate, &mut self.peak].into_iter().flatten() {
+            bucket.take(n as f64);
+        }
+    }
+
+    /// A new packet: Some(it) to send now, or None (it waits, or is dropped when the queue is full).
+    pub fn offer(&mut self, packet: P, n: usize, mut total: Option<&mut Bucket>, now: Instant) -> Option<P> {
+        if self.queue.is_empty() && self.fits(n, now) && total.as_deref_mut().is_none_or(|t| t.has(n as f64, now)) {
+            if let Some(t) = total {
+                t.take(n as f64);
+            }
+            self.spend(n);
+            return Some(packet);
+        }
+        if self.queue.len() < QUEUE_PACKETS && self.queued + n <= QUEUE_BYTES {
+            self.queue.push_back((packet, n));
+            self.queued += n;
+        }
+        None
+    }
+
+    /// The waiting packets that may go now.
+    pub fn release(&mut self, mut total: Option<&mut Bucket>, now: Instant, out: &mut Vec<P>) {
+        while let Some(&(_, n)) = self.queue.front() {
+            if !self.fits(n, now) || total.as_mut().is_some_and(|t| !t.has(n as f64, now)) {
+                break;
+            }
+            self.spend(n);
+            if let Some(t) = total.as_mut() {
+                t.take(n as f64);
+            }
+            let (packet, _) = self.queue.pop_front().unwrap();
+            self.queued -= n;
+            out.push(packet);
+        }
+    }
+
+    pub fn waiting(&self) -> bool {
+        !self.queue.is_empty()
+    }
+}
+
+/// The (kbit/s, burst, seconds) of a limit in one direction (`down`: to the device).
+pub fn direction(limit: &Limit, down: bool) -> (u32, u32, u32) {
+    if down { (limit.down, limit.burst_down, limit.burst_secs) } else { (limit.up, limit.burst_up, limit.burst_secs) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// How many bytes a lane lets through in `seconds` of a sender pushing as fast as it can.
+    fn throughput(limit: (u32, u32, u32), seconds: f64) -> f64 {
+        let start = Instant::now();
+        let mut lane: Lane<usize> = Lane::new(limit, start);
+        let (mut sent, mut out) = (0usize, vec![]);
+        let steps = (seconds * 1000.0) as u64;
+        for ms in 0..steps {
+            let now = start + Duration::from_millis(ms);
+            for _ in 0..4 {
+                if lane.offer(1500, 1500, None, now).is_some() {
+                    sent += 1500;
+                }
+            }
+            lane.release(None, now, &mut out);
+        }
+        sent += out.len() * 1500;
+        sent as f64
+    }
+
+    #[test]
+    fn holds_the_rate() {
+        let got = throughput((2000, 0, 0), 10.0) * 8.0 / 10.0 / 1000.0; // kbit/s
+        assert!((1900.0..2150.0).contains(&got), "{got}");
+    }
+
+    #[test]
+    fn bursts_then_settles() {
+        // 2 Mbps, bursting to 4 Mbps for 2 s: the first 2 s go about twice as fast
+        let first = throughput((2000, 4000, 2), 2.0) * 8.0 / 2.0 / 1000.0;
+        assert!(first > 3400.0, "{first}");
+        let long = throughput((2000, 4000, 2), 20.0) * 8.0 / 20.0 / 1000.0;
+        assert!(long < 2400.0, "{long}");
+    }
+
+    #[test]
+    fn total_cap_holds_lanes() {
+        let start = Instant::now();
+        let mut total = Bucket::new(bytes(1000), 2.0 * MTU, start);
+        let mut lanes: Vec<Lane<usize>> = (0..3).map(|_| Lane::new((5000, 0, 0), start)).collect();
+        let (mut sent, mut out) = (0usize, vec![]);
+        for ms in 0..5000u64 {
+            let now = start + Duration::from_millis(ms);
+            for lane in &mut lanes {
+                if lane.offer(1500, 1500, Some(&mut total), now).is_some() {
+                    sent += 1500;
+                }
+                lane.release(Some(&mut total), now, &mut out);
+            }
+        }
+        let kbit = (sent + out.len() * 1500) as f64 * 8.0 / 5.0 / 1000.0;
+        assert!((900.0..1150.0).contains(&kbit), "{kbit}");
+    }
+}

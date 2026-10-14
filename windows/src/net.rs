@@ -1,14 +1,59 @@
 //! What Windows knows about the network adapters: their names ("TP-Link Wireless MU-MIMO USB
-//! Adapter"), and how much the hotspot's own adapter has sent and received (its live speed).
+//! Adapter"), which one is the hotspot's and how much it has sent and received (its live speed),
+//! and the devices next to it (their MAC addresses, from Windows' neighbour table).
 
-use windows::core::GUID;
+use windows::core::{w, GUID};
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::*;
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+use windows::Win32::Networking::WinSock::*;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 
-/// The hotspot's address on the PC (Internet Connection Sharing's): its adapter has it.
-const HOTSPOT_IP: [u8; 4] = [192, 168, 137, 1];
+/// The hotspot's address on the PC, which Internet Connection Sharing gives its adapter.
+pub fn gateway() -> [u8; 4] {
+    let mut buffer = [0u16; 32];
+    let mut size = (buffer.len() * 2) as u32;
+    // SAFETY: reads a short string into our buffer, no more than its size
+    let read = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, w!(r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters"),
+                     w!("ScopeAddress"), RRF_RT_REG_SZ, None, Some(buffer.as_mut_ptr().cast()), Some(&mut size))
+    };
+    let text = String::from_utf16_lossy(&buffer[..buffer.iter().position(|&c| c == 0).unwrap_or(0)]);
+    let parts: Option<Vec<u8>> = text.split('.').map(|p| p.trim().parse().ok()).collect();
+    match (read.is_ok(), parts.and_then(|p| <[u8; 4]>::try_from(p).ok())) {
+        (true, Some(ip)) => ip,
+        _ => [192, 168, 137, 1],
+    }
+}
+
+/// The hotspot's adapter, while it's on: the one with the hotspot's address.
+pub fn hotspot_adapter() -> Option<Adapter> {
+    let gateway = gateway();
+    adapters().into_iter().find(|a| a.up && a.ipv4.contains(&gateway))
+}
+
+/// The devices Windows has seen on an adapter lately: (address, MAC "aa:bb:…").
+pub fn neighbors(index: u32) -> Vec<([u8; 4], String)> {
+    let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+    // SAFETY: Windows allocates the table; we read its rows and free it
+    unsafe {
+        if GetIpNetTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+            return vec![];
+        }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let live = [NlnsReachable, NlnsStale, NlnsDelay, NlnsProbe, NlnsPermanent];
+        let found = rows.iter().filter(|r| r.InterfaceIndex == index && live.contains(&r.State) && r.PhysicalAddressLength == 6)
+            .map(|r| {
+                let b = r.Address.Ipv4.sin_addr.S_un.S_un_b;
+                let mac = r.PhysicalAddress[..6].iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":");
+                ([b.s_b1, b.s_b2, b.s_b3, b.s_b4], mac)
+            })
+            .filter(|(ip, mac)| ip[3] != 255 && mac != "ff:ff:ff:ff:ff:ff" && !mac.starts_with("01:00:5e"))
+            .collect();
+        FreeMibTable(table.cast());
+        found
+    }
+}
 
 pub struct Adapter {
     pub id: GUID,
@@ -77,7 +122,7 @@ fn virtual_adapter(description: &str) -> bool {
 
 /// Bytes (sent to the devices, received from them) through the hotspot so far, while it's on.
 pub fn hotspot_traffic() -> Option<(u64, u64)> {
-    let adapter = adapters().into_iter().find(|a| a.up && a.ipv4.contains(&HOTSPOT_IP))?;
+    let adapter = hotspot_adapter()?;
     let mut row = MIB_IF_ROW2 { InterfaceIndex: adapter.index, ..Default::default() };
     // SAFETY: Windows fills the row of the interface we name
     (unsafe { GetIfEntry2(&mut row) } == NO_ERROR).then_some((row.OutOctets, row.InOctets))

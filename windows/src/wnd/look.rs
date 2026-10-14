@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Marks on buttons (window properties) for how they're drawn.
 pub const PRIMARY: PCWSTR = w!("HotspotManager.Primary"); // the main button: in the accent colour
+pub const DANGER: PCWSTR = w!("HotspotManager.Danger"); // a button that stops something: in red
 pub const FLAT: PCWSTR = w!("HotspotManager.Flat"); // no fill until the mouse is on it
 pub const ICON: PCWSTR = w!("HotspotManager.Icon"); // its text is an icon (Windows' icon font)
 pub const SWITCH: PCWSTR = w!("HotspotManager.Switch"); // a check box drawn as a switch
@@ -91,7 +92,9 @@ pub(super) fn handle(win: &Window, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             let (dc, control) = (HDC(wparam.0 as *mut _), HWND(lparam.0 as *mut _));
             let (bg, fg) = if class_is(control, "Edit") {
-                (theme::VIEW, theme::TEXT)
+                // SAFETY: plain query
+                let on = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(control) }.as_bool();
+                (theme::VIEW, if on { theme::TEXT } else { theme::DISABLED }) // greyed, as GTK's
             } else {
                 let fg = win.colors.borrow().get(&(control.0 as isize)).copied().unwrap_or(theme::TEXT);
                 (surface_at(win, rect_in(control, win.hwnd())), fg)
