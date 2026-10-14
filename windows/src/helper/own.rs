@@ -85,7 +85,10 @@ impl Own {
             true => String::new(),
             false => format!("{}\n", unshare_script(&[&self.internet_id, &self.id])),
         };
-        let script = format!("{unshare}netsh interface ipv4 set address name={} source=dhcp | Out-Null", self.index);
+        // (back to automatic addresses: netsh says no when the adapter is gone or is so already,
+        // and its answer would be PowerShell's; sharing's errors still count)
+        let script = format!("$ErrorActionPreference = 'Stop'\n{unshare}\
+                              netsh interface ipv4 set address name={} source=dhcp | Out-Null\nexit 0", self.index);
         match powershell(&script) {
             Ok(_) => {
                 let _ = std::fs::remove_file(log::folder().join(RECORD));
