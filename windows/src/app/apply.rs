@@ -47,12 +47,17 @@ pub fn move_hotspot(app: &Rc<App>, gateway: [u8; 4]) {
         if was_on && result.is_ok() {
             result = hotspot::switch(adapter, true);
         }
+        // Windows may keep its own address until the PC restarts
+        std::thread::sleep(std::time::Duration::from_secs(if was_on { 4 } else { 0 }));
+        let kept = crate::net::hotspot_adapter().and_then(|a| a.ipv4.first().copied()).filter(|ip| *ip != gateway);
         super::post(move |app| {
             app.busy.set(None);
-            match result {
-                Ok(()) if was_on => app.say(format!("The hotspot restarted at {}.", ip_text(gateway)), false),
-                Ok(()) => app.say(format!("The hotspot will be at {} when it's turned on.", ip_text(gateway)), false),
-                Err(why) => app.say(why, true),
+            match (result, kept) {
+                (Ok(()), Some(ip)) => app.say(format!("Windows kept the hotspot at {}: the new address may need the PC to restart.",
+                                                      ip_text(ip)), true),
+                (Ok(()), None) if was_on => app.say(format!("The hotspot restarted at {}.", ip_text(gateway)), false),
+                (Ok(()), None) => app.say(format!("The hotspot will be at {} when it's turned on.", ip_text(gateway)), false),
+                (Err(why), _) => app.say(why, true),
             }
             app.refresh();
         });

@@ -17,7 +17,8 @@ pub fn set_gateway(ip: Ip) -> Result<(), String> {
         return Err("The hotspot's address must be a private one (10.x, 172.16–31.x or 192.168.x), not ending in 0 or 255".into());
     }
     let text: Vec<u16> = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]).encode_utf16().chain([0]).collect();
-    for name in [w!("ScopeAddress"), w!("ScopeAddressBackup")] {
+    // (ICS reads ScopeAddress; Windows' mobile hotspot, StandaloneDhcpAddress)
+    for name in [w!("ScopeAddress"), w!("ScopeAddressBackup"), w!("StandaloneDhcpAddress")] {
         // SAFETY: writes a string value as long as we say
         let result = unsafe {
             RegSetKeyValueW(HKEY_LOCAL_MACHINE, KEY, name, REG_SZ.0, Some(text.as_ptr().cast()), (text.len() * 2) as u32)
@@ -30,13 +31,18 @@ pub fn set_gateway(ip: Ip) -> Result<(), String> {
     Ok(())
 }
 
-/// Internet Connection Sharing reads the address when it starts: restart it (if it's running;
-/// the hotspot should be off meanwhile).
+/// Windows' sharing and its mobile hotspot read the address when they start: restart them (the
+/// hotspot is off meanwhile; it starts the mobile hotspot service again when it's turned on).
 fn restart_sharing() {
-    // SAFETY: Windows' service manager, on the SharedAccess service; handles closed at the end
+    stop_service(w!("icssvc"), false);
+    stop_service(w!("SharedAccess"), true);
+}
+
+fn stop_service(name: PCWSTR, start_again: bool) {
+    // SAFETY: Windows' service manager, on one of its services; handles closed at the end
     unsafe {
         let Ok(manager) = OpenSCManagerW(None, None, SC_MANAGER_CONNECT) else { return };
-        if let Ok(service) = OpenServiceW(manager, w!("SharedAccess"), SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS) {
+        if let Ok(service) = OpenServiceW(manager, name, SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS) {
             let mut status = SERVICE_STATUS::default();
             if ControlService(service, SERVICE_CONTROL_STOP, &mut status).is_ok() {
                 for _ in 0..50 {
@@ -46,7 +52,9 @@ fn restart_sharing() {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                let _ = StartServiceW(service, None);
+                if start_again {
+                    let _ = StartServiceW(service, None);
+                }
             }
             let _ = CloseServiceHandle(service);
         }

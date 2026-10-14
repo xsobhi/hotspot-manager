@@ -120,10 +120,22 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
         ssid: config.Ssid().map(|s| s.to_string()).unwrap_or_default(),
         passphrase: config.Passphrase().map(|s| s.to_string()).unwrap_or_default(),
         band,
-        clients: if state == State::On { clients(&m) } else { vec![] },
+        clients: if state == State::On { with_neighbours(clients(&m)) } else { vec![] },
         max_clients: m.MaxClientCount().unwrap_or(8),
         local: false,
     })
+}
+
+/// Windows lists the devices its own DHCP served: the helper's too, from the hotspot's neighbours.
+fn with_neighbours(mut list: Vec<Client>) -> Vec<Client> {
+    if let Some(adapter) = net::hotspot_adapter() {
+        for (ip, mac) in net::neighbors(adapter.index) {
+            if !list.iter().any(|c| c.mac == mac) {
+                list.push(Client { mac, host: None, ip: Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])) });
+            }
+        }
+    }
+    list
 }
 
 fn clients(m: &NetworkOperatorTetheringManager) -> Vec<Client> {
