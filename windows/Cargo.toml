@@ -1,0 +1,31 @@
+[package]
+name = "hotspot-manager"
+version = "0.1.0"
+edition = "2024"
+description = "Windows' Wi-Fi hotspot on the adapter you pick, with its devices, a QR code and start at sign-in"
+license = "MIT"
+repository = "https://github.com/xsobhi/hotspot-manager-linux"
+
+[dependencies]
+qrcodegen = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-numerics = "0.2" # (Direct2D's points)
+windows = { version = "0.61", features = [
+    "Foundation", "Foundation_Collections", "Devices_WiFi", "Networking", "Networking_Connectivity",
+    "Networking_NetworkOperators",
+    "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus",
+    "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock",
+    "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory",
+    "Win32_Security_Cryptography", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_Controls",
+    "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
