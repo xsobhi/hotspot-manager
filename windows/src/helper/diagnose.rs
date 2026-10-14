@@ -16,7 +16,8 @@ pub fn diagnose(gateway: Ip, hotspot: u32) {
     let before = shared().lock().unwrap().counts;
     for (name, layer, filter) in [("forwarded", LAYER_FORWARD, any.clone()),
                                   ("to/from this PC", LAYER_NETWORK, format!("ifIdx == {hotspot} or ({any})")),
-                                  ("forwarded, the internet side", LAYER_FORWARD, format!("ip and ifIdx == {internet} and not ({any})"))] {
+                                  ("forwarded, the internet side", LAYER_FORWARD, format!("ip and ifIdx == {internet}")),
+                                  ("sent to the internet", LAYER_NETWORK, format!("outbound and ip and ifIdx == {internet}"))] {
         let found = Arc::new(Mutex::new(std::collections::BTreeMap::<String, (u64, u64)>::new()));
         let divert = match Divert::sniff(&filter, layer) {
             Ok(divert) => divert,

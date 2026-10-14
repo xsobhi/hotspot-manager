@@ -173,6 +173,7 @@ impl App {
             let mut store = self.store.borrow_mut();
             store.adapter = adapter.map(|id| format!("{id:?}"));
             (store.ssid, store.passphrase) = (ssid.clone(), password.clone()); // (the local-only hotspot's too)
+            store.band = band.key().to_string();
             store.save();
         }
         let was_on = self.state() == Some(State::On);

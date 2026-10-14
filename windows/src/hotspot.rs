@@ -25,6 +25,21 @@ pub enum Band {
     Five,
 }
 
+impl Band {
+    /// How the app keeps it (Store::band).
+    pub fn key(self) -> &'static str {
+        match self {
+            Band::Any => "any",
+            Band::Five => "5",
+            Band::TwoPointFour => "2.4",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Band> {
+        [Band::Any, Band::Five, Band::TwoPointFour].into_iter().find(|b| b.key() == key)
+    }
+}
+
 pub const BANDS: [(Band, &str); 3] = [(Band::Any, "Any available"), (Band::Five, "5 GHz (faster)"),
                                       (Band::TwoPointFour, "2.4 GHz (longer range, older devices)")];
 
@@ -94,8 +109,10 @@ pub fn own_address() -> bool {
 }
 
 /// The app's own hotspot's state (local.rs), and the devices on it (from Windows' neighbour table).
+/// Its band is the one chosen (it's kept to it by the adapter's driver), else `band`: Windows'.
 fn local_status(band: Band) -> Status {
     let store = Store::load();
+    let band = Band::from_key(&store.band).unwrap_or(band);
     let on = local::running();
     let clients = net::hotspot_adapter().filter(|_| on).map(|a| net::neighbors(a.index)).unwrap_or_default()
         .into_iter().map(|(ip, mac)| Client { mac, host: None, ip: Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])) })
@@ -106,7 +123,10 @@ fn local_status(band: Band) -> Status {
 
 pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
     if local::running() || !online() {
-        return Ok(local_status(Band::Any));
+        // (the band Windows keeps for its own hotspot, when it can say: the one chosen before)
+        let band = manager(adapter).ok().filter(|_| online()).and_then(|m| m.GetCurrentAccessPointConfiguration().ok())
+            .map(|c| band_of(&c));
+        return Ok(local_status(band.unwrap_or(Band::Any)));
     }
     let m = manager(adapter)?;
     let state = match m.TetheringOperationalState() {
@@ -116,11 +136,7 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
         _ => State::Unknown,
     };
     let config = m.GetCurrentAccessPointConfiguration().map_err(|e| message(&e))?;
-    let band = match config.Band() {
-        Ok(TetheringWiFiBand::TwoPointFourGigahertz) => Band::TwoPointFour,
-        Ok(TetheringWiFiBand::FiveGigahertz) => Band::Five,
-        _ => Band::Any,
-    };
+    let band = band_of(&config);
     if state == State::Off && own_address() {
         return Ok(local_status(band)); // (turning it on starts the app's own)
     }
@@ -133,6 +149,14 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
         max_clients: m.MaxClientCount().unwrap_or(8),
         local: false,
     })
+}
+
+fn band_of(config: &NetworkOperatorTetheringAccessPointConfiguration) -> Band {
+    match config.Band() {
+        Ok(TetheringWiFiBand::TwoPointFourGigahertz) => Band::TwoPointFour,
+        Ok(TetheringWiFiBand::FiveGigahertz) => Band::Five,
+        _ => Band::Any,
+    }
 }
 
 /// Windows lists the devices its own DHCP served: the helper's too, from the hotspot's neighbours.

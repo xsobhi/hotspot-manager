@@ -61,7 +61,7 @@ impl Own {
     /// unable to invoke any of the subscribers": tried again every ten seconds, for five minutes).
     fn share(&mut self) {
         self.tries = (self.tries.0 + 1, Some(Instant::now()));
-        match share(&self.internet_id, &self.id) {
+        match share(&self.internet_id, &self.id, self.tries.0 > 1) {
             Ok(()) => {
                 self.shared = true;
                 save(RECORD, &*self);
@@ -103,9 +103,14 @@ impl Own {
 }
 
 /// Windows' classic sharing: the internet connection shared (public), with the hotspot's adapter
-/// (private). Only one connection can be shared: any other stops being.
-fn share(public: &str, private: &str) -> Result<(), String> {
-    powershell(&format!("$ErrorActionPreference = 'Stop'
+/// (private). Only one connection can be shared: any other stops being. Windows' mobile hotspot
+/// service gets in its way (it refuses with 0x80040201), so it's stopped first (it isn't hosting:
+/// the app is); `afresh`: Windows' sharing restarts too, when it refused before.
+fn share(public: &str, private: &str, afresh: bool) -> Result<(), String> {
+    let restart = if afresh { "Restart-Service SharedAccess -Force -ErrorAction SilentlyContinue" } else { "" };
+    powershell(&format!("Stop-Service icssvc -Force -ErrorAction SilentlyContinue
+        {restart}
+        $ErrorActionPreference = 'Stop'
         $m = New-Object -ComObject HNetCfg.HNetShare
         $public = $null; $private = $null
         foreach ($c in @($m.EnumEveryConnection)) {{

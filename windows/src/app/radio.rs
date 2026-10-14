@@ -2,14 +2,27 @@
 //! Windows' hotspot has no say in them; an adapter's driver may (Device Manager → Advanced), so
 //! they're offered as the driver names them, when the hotspot has an adapter of its own (a USB
 //! one, say). Greyed, with why, when the driver doesn't have them, or when the hotspot shares its
-//! radio with the PC's own Wi-Fi connection (then it's on that network's channel).
+//! radio with the PC's own Wi-Fi connection (then it's on that network's channel). Without a width
+//! setting, the width goes through the Wi-Fi mode (802.11ac: up to 80 MHz, n: 40, a/g: 20), when
+//! the band is set (5 GHz or 2.4 GHz).
 
 use crate::driver::{self, Kind, Property};
 use crate::theme;
-use crate::wnd::{choice_index, enable, place, Window, FIELD, LINE};
+use crate::wnd::{choice_index, enable, place, set_choice, Window, FIELD, LINE};
 use crate::{hotspot, net};
+use std::cell::Cell;
+use std::rc::Rc;
 use windows::core::GUID;
 use windows::Win32::Foundation::HWND;
+
+/// "Up to 80 MHz (802.11ac)", "20 MHz (802.11a)": a width, and the mode that gives it.
+fn width_name(mhz: u32, mode: &str) -> String {
+    let standard = mode.to_lowercase().find("802.11").map(|at| &mode[at..]).unwrap_or(mode).to_string();
+    match mhz {
+        20 => format!("20 MHz ({standard})"),
+        _ => format!("Up to {mhz} MHz ({standard})"),
+    }
+}
 
 /// What the hotspot's adapter and its driver allow (found off the UI thread: it asks PowerShell).
 pub struct Found {
@@ -35,8 +48,25 @@ impl Radio {
     pub fn new(window: &Window, found: &Found) -> Radio {
         let usable = found.adapter.is_some() && !found.shared;
         let mut rows = vec![];
+        // the width through the Wi-Fi mode, when the driver has no width of its own: the two choices
+        // follow each other (only the mode is saved)
+        let mode = found.settings.iter().find(|(k, _)| *k == Kind::Mode).map(|(_, p)| p.clone());
+        let widths = mode.as_ref().filter(|_| usable && !found.settings.iter().any(|(k, _)| *k == Kind::Width))
+            .map(driver::widths).filter(|w| w.len() > 1).unwrap_or_default();
+        let (width_row, mode_row) = (Rc::new(Cell::new(HWND::default())), Rc::new(Cell::new(HWND::default())));
         for (kind, name) in [(Kind::Channel, "Channel"), (Kind::Width, "Channel width"), (Kind::Mode, "Wi-Fi mode")] {
             let offered: Vec<&Property> = found.settings.iter().filter(|(k, _)| *k == kind).map(|(_, p)| p).collect();
+            if kind == Kind::Width && !widths.is_empty() {
+                let names: Vec<String> = widths.iter().map(|(mhz, i)| width_name(*mhz, &mode.as_ref().unwrap().choices()[*i])).collect();
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                let now = mode.as_ref().and_then(|m| driver::width_of(&m.value));
+                let at = widths.iter().position(|(mhz, _)| Some(*mhz) == now).unwrap_or(0);
+                let (m, w) = (mode_row.clone(), widths.clone());
+                let choice = window.choice(&names, at, move |picked| set_choice(m.get(), w[picked].1));
+                width_row.set(choice);
+                rows.push((window.name(name), choice, None));
+                continue;
+            }
             if offered.is_empty() && kind != Kind::Mode {
                 let choice = window.choice(&["Automatic"], 0, |_| {});
                 enable(choice, false);
@@ -46,20 +76,33 @@ impl Radio {
                 let choices = p.choices();
                 let names: Vec<&str> = choices.iter().map(String::as_str).collect();
                 let at = choices.iter().position(|c| *c == p.value).unwrap_or(0);
-                let choice = window.choice(&names, at, |_| {});
+                let (w, ws, all) = (width_row.clone(), widths.clone(), choices.clone());
+                let choice = window.choice(&names, at, move |picked| {
+                    // the width shown follows the mode picked (on the same band)
+                    let mhz = driver::width_of(&all[picked]);
+                    if let Some(i) = ws.iter().position(|(m, _)| Some(*m) == mhz) {
+                        set_choice(w.get(), i);
+                    }
+                });
+                if kind == Kind::Mode {
+                    mode_row.set(choice);
+                }
                 enable(choice, usable);
                 rows.push((window.name(&p.name), choice, Some(p.clone())));
             }
         }
-        let has = |kind: Kind| found.settings.iter().any(|(k, _)| *k == kind);
+        let has = |kind: Kind| found.settings.iter().any(|(k, _)| *k == kind) || (kind == Kind::Width && !widths.is_empty());
         let why = match (&found.adapter, found.shared) {
             (None, _) => "Windows picks the hotspot's adapter, so its channel and width too. Pick the adapter that hosts it \
                           (Settings) to see what its driver lets you set.".to_string(),
             (Some((_, name)), true) => format!("{name} is also the PC's internet connection: the hotspot shares its radio, so \
                                                it's on that network's channel and width."),
             (Some((_, name)), false) if !has(Kind::Channel) && !has(Kind::Width) => format!(
-                "{name}'s driver doesn't let programs choose the channel or its width: Windows picks them. Changing the Wi-Fi \
-                 mode restarts the adapter, and the hotspot with it."),
+                "{name}'s driver doesn't let programs choose the channel or its width: Windows picks them (set the band to \
+                 5 GHz or 2.4 GHz to choose the width). Changing the Wi-Fi mode restarts the adapter, and the hotspot with it."),
+            (Some((_, name)), false) if !has(Kind::Channel) && !widths.is_empty() => format!(
+                "{name}'s driver doesn't offer a channel: Windows picks it. The width goes through the Wi-Fi mode (802.11ac \
+                 allows up to 80 MHz, n 40, a or g 20). Changing these restarts the adapter, and the hotspot with it."),
             (Some((_, name)), false) if !has(Kind::Channel) => format!(
                 "{name}'s driver doesn't offer a channel: Windows picks it. Changing these restarts the adapter, and the \
                  hotspot with it."),

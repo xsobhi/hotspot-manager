@@ -47,6 +47,7 @@ impl Lanes {
 
 pub struct Engine {
     divert: Arc<Divert>,
+    uploads: Arc<Divert>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -55,9 +56,27 @@ impl Engine {
     /// Count and limit the devices' traffic (they're in `gateway`'s subnet).
     pub fn start(shared: Arc<Mutex<Shared>>, gateway: Ip) -> Result<Engine, String> {
         let net = format!("{}.{}.{}", gateway[0], gateway[1], gateway[2]);
-        let filter = format!("ip and ((ip.SrcAddr >= {net}.0 and ip.SrcAddr <= {net}.255) or \
-                              (ip.DstAddr >= {net}.0 and ip.DstAddr <= {net}.255))");
+        let inside = |field: &str| format!("ip.{field} >= {net}.0 and ip.{field} <= {net}.255");
+        let outside = |field: &str| format!("(ip.{field} < {net}.0 or ip.{field} > {net}.255)");
+        // to the devices (and between them): held for the speed limits, blocks and keeping apart
+        let filter = format!("ip and {}", inside("DstAddr"));
+        // from the devices out: Windows' sharing sends them on itself, whatever WinDivert does with
+        // them (held back, they only went out twice), so they're counted, not held
+        let uploads = format!("ip and {} and {}", inside("SrcAddr"), outside("DstAddr"));
         let divert = Arc::new(Divert::open(&filter, LAYER_FORWARD, PRIORITY)?);
+        let uploads = Arc::new(Divert::sniff(&uploads, LAYER_FORWARD)?);
+        let (u, s) = (uploads.clone(), shared.clone());
+        let counting = std::thread::spawn(move || {
+            let mut buffer = vec![0u8; 65535];
+            while let Some((n, _)) = u.recv(&mut buffer) {
+                if n >= 20 {
+                    let device: Ip = buffer[12..16].try_into().unwrap();
+                    let mut s = s.lock().unwrap();
+                    s.counts[0].seen += 1;
+                    s.usage.entry(device).or_default().1 += n as u64;
+                }
+            }
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (divert.clone(), shared.clone());
         let capture = std::thread::spawn(move || {
@@ -96,12 +115,13 @@ impl Engine {
             }
         });
         log::line(format!("Counting and limiting the hotspot's traffic ({net}.x)"));
-        Ok(Engine { divert, stop, threads: vec![capture, release] })
+        Ok(Engine { divert, uploads, stop, threads: vec![capture, release, counting] })
     }
 
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         self.divert.shutdown();
+        self.uploads.shutdown();
         for thread in self.threads {
             let _ = thread.join();
         }
