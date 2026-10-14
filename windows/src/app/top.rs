@@ -77,6 +77,12 @@ fn paint(p: &Painter, app: &App) {
     let (line, line_color) = match (app.note(), &*status, ok) {
         (Some((note, error)), ..) => (note, if error { theme::DANGER } else { theme::ACCENT }),
         (None, Some(Err(why)), _) => (why.clone(), theme::DANGER),
+        (None, _, Some(s)) if s.state == State::On && s.local => {
+            (format!("“{}”  ·  local only: no internet to share  ·  {} devices", s.ssid, s.clients.len()), theme::DIM)
+        }
+        (None, _, Some(s)) if s.local => {
+            (format!("“{}”  ·  no internet: turning it on starts a local-only hotspot", s.ssid), theme::DIM)
+        }
         (None, _, Some(s)) if s.state == State::On => {
             let (down, up) = app.speed.get();
             let devices = match s.clients.len() {

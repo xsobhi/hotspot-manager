@@ -120,15 +120,22 @@ impl App {
         let band: Band = BANDS[choice_index(s.band)].0;
         let adapter = choice_index(s.adapter).checked_sub(1).and_then(|i| s.adapters.get(i)).map(|(id, _)| *id);
         let before = self.store.borrow().adapter_id();
-        self.store.borrow_mut().adapter = adapter.map(|id| format!("{id:?}"));
-        self.store.borrow().save();
+        {
+            let mut store = self.store.borrow_mut();
+            store.adapter = adapter.map(|id| format!("{id:?}"));
+            (store.ssid, store.passphrase) = (ssid.clone(), password.clone()); // (the local-only hotspot's too)
+            store.save();
+        }
         let was_on = self.state() == Some(State::On);
+        let local = self.status.borrow().as_ref().and_then(|s| s.as_ref().ok()).is_some_and(|s| s.local);
         self.busy.set(Some("Saving…"));
         self.update();
         worker::run(move || {
             // Windows uses new settings when the hotspot starts: restart it if it's on
             let mut result = if was_on { hotspot::switch(before, false) } else { Ok(()) };
-            result = result.and_then(|()| hotspot::configure(adapter, &ssid, &password, band));
+            if !local {
+                result = result.and_then(|()| hotspot::configure(adapter, &ssid, &password, band));
+            }
             if was_on {
                 result = result.and(hotspot::switch(adapter, true));
             }

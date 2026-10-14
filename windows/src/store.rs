@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(default)]
 pub struct Store {
     pub adapter: Option<String>, // network adapter id of the Wi-Fi adapter to host on
+    pub ssid: String,            // the hotspot's name and password, for the local-only hotspot
+    pub passphrase: String,      // (Windows keeps them for its own, but asks for an internet connection)
     pub devices: BTreeMap<String, Device>,
 }
 
@@ -30,7 +32,8 @@ pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn folder() -> PathBuf {
+/// Where the app keeps its things.
+pub fn folder_path() -> PathBuf {
     match std::env::var_os("HOTSPOT_HOME") {
         Some(home) => PathBuf::from(home),
         None => PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("Hotspot Manager"),
@@ -38,13 +41,17 @@ fn folder() -> PathBuf {
 }
 
 impl Store {
+    pub fn folder() -> PathBuf {
+        folder_path()
+    }
+
     pub fn load() -> Store {
-        std::fs::read_to_string(folder().join("settings.json")).ok()
+        std::fs::read_to_string(folder_path().join("settings.json")).ok()
             .and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let dir = folder();
+        let dir = folder_path();
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let temp = dir.join("settings.json.new"); // written whole, then swapped in

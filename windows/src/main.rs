@@ -6,6 +6,7 @@
 //!   hotspot-manager --turn-on   turn the hotspot on and exit (at sign-in)
 //!   hotspot-manager --service   the helper, as the HotspotManager service (Windows starts it)
 //!   hotspot-manager --helper    the helper in a console, as administrator (for trying it)
+//!   hotspot-manager --local-hotspot   the hotspot without internet (the window starts it)
 
 #![windows_subsystem = "windows"] // no console window behind the app
 
@@ -13,6 +14,7 @@ mod app;
 mod client;
 mod helper;
 mod hotspot;
+mod local;
 mod net;
 mod rules;
 mod startup;
@@ -30,6 +32,7 @@ fn main() {
         "--turn-on" => startup::turn_on(),
         "--service" => helper::service::run(),
         "--helper" => helper::run_here(),
+        "--local-hotspot" => local::serve(),
         _ => app::run(),
     });
 }

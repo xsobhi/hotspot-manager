@@ -30,6 +30,9 @@ the adapter you pick, so a **USB Wi-Fi dongle hosts it** while the PC's own Wi-F
 As on Linux:
 
 - **On/off switch**, the hotspot's state, its devices and its live speed, and a **QR code** to join
+- **Works without internet too**: Windows' own hotspot only starts with a connection to share; with none, the
+  switch starts a local-only hotspot (Windows' Wi-Fi Direct as a normal access point, as MyPublicWiFi does), so
+  phones and laptops can still reach each other and this PC (local games, sharing files)
 - **Name, password** (show it, or generate one), **band** (5 / 2.4 GHz), **which Wi-Fi adapter** hosts it, and
   **turn on automatically** when you sign in
 - **Devices**: connected now (and offline ones, if you like), with their name, maker, IP, MAC, **live speed**,
@@ -64,8 +67,8 @@ powershell -ExecutionPolicy Bypass -File windows\install.ps1
 That builds it, asks for administrator rights once, and installs it in `C:\Program Files\Hotspot Manager` with
 the helper service and WinDivert, in the Start menu and on the desktop (`windows\install.ps1 -Uninstall`
 removes it all). **Microsoft Defender often flags WinDivert** as potentially unwanted, because malware uses
-packet drivers too: if the installer says it couldn't set it up, allow it in Windows Security → Protection
-history, and run the installer again. Without it, everything but speed limits, blocking and data used works.
+packet drivers too: run the installer with `-AllowWinDivert` to ask Defender to leave just the program's
+folder alone (`-Uninstall` takes that back). Without it, everything but speed limits, blocking and data used works.
 `hotspot-manager --turn-on` turns the hotspot on without a window.
 
 ## Why not NetworkManager's built-in hotspot?

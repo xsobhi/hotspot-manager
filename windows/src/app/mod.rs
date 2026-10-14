@@ -88,7 +88,13 @@ impl App {
 
     fn got(&self, status: Result<Status, String>, helper: Result<HelperStatus, String>) {
         if let Ok(s) = &status {
-            let changed = self.store.borrow_mut().seen(&s.clients);
+            let mut store = self.store.borrow_mut();
+            let renamed = !s.local && (store.ssid != s.ssid || store.passphrase != s.passphrase);
+            if renamed {
+                (store.ssid, store.passphrase) = (s.ssid.clone(), s.passphrase.clone()); // for the local-only hotspot
+            }
+            drop(store);
+            let changed = self.store.borrow_mut().seen(&s.clients) || renamed;
             if changed {
                 self.store.borrow().save();
             }

@@ -8,6 +8,7 @@ use windows::Devices::WiFi::WiFiAdapter;
 use windows::Networking::Connectivity::{NetworkAdapter, NetworkInformation};
 use windows::Networking::HostNameType;
 use windows::Networking::NetworkOperators::*;
+use crate::{local, net, store::Store};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -42,6 +43,7 @@ pub struct Status {
     pub band: Band,
     pub clients: Vec<Client>,
     pub max_clients: u32,
+    pub local: bool, // local only: no internet to share (local.rs)
 }
 
 fn message(e: &Error) -> String {
@@ -75,7 +77,26 @@ fn network_adapter(id: GUID) -> Option<NetworkAdapter> {
         .find(|a| a.NetworkAdapterId().ok() == Some(id))
 }
 
+/// Is there an internet connection to share?
+pub fn online() -> bool {
+    NetworkInformation::GetInternetConnectionProfile().is_ok()
+}
+
+/// The local-only hotspot's state, and the devices on it (from Windows' neighbour table).
+fn local_status() -> Status {
+    let store = Store::load();
+    let on = local::running();
+    let clients = net::hotspot_adapter().filter(|_| on).map(|a| net::neighbors(a.index)).unwrap_or_default()
+        .into_iter().map(|(ip, mac)| Client { mac, host: None, ip: Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])) })
+        .collect();
+    Status { state: if on { State::On } else { State::Off }, ssid: store.ssid, passphrase: store.passphrase, band: Band::Any,
+             clients, max_clients: 8, local: true }
+}
+
 pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
+    if local::running() || !online() {
+        return Ok(local_status());
+    }
     let m = manager(adapter)?;
     let state = match m.TetheringOperationalState() {
         Ok(TetheringOperationalState::On) => State::On,
@@ -96,6 +117,7 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
         band,
         clients: if state == State::On { clients(&m) } else { vec![] },
         max_clients: m.MaxClientCount().unwrap_or(8),
+        local: false,
     })
 }
 
@@ -123,6 +145,14 @@ fn clients(m: &NetworkOperatorTetheringManager) -> Vec<Client> {
 
 /// Turn the hotspot on or off.
 pub fn switch(adapter: Option<GUID>, on: bool) -> Result<(), String> {
+    // without internet to share: the local-only hotspot (Windows' own won't start)
+    if !on && local::running() {
+        local::stop();
+        return Ok(());
+    }
+    if on && !online() {
+        return local::start();
+    }
     let m = manager(adapter)?;
     let operation = if on { m.StartTetheringAsync() } else { m.StopTetheringAsync() };
     let result = operation.and_then(|op| op.get()).map_err(|e| message(&e))?;
