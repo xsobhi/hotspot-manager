@@ -1,4 +1,4 @@
-# Install Hotspot Manager for Windows (it asks for administrator rights once):
+﻿# Install Hotspot Manager for Windows (it asks for administrator rights once):
 #   powershell -ExecutionPolicy Bypass -File windows\install.ps1             install (builds it first, with Rust)
 #   powershell -ExecutionPolicy Bypass -File windows\install.ps1 -Uninstall  remove it
 #   ... -AllowWinDivert   also tell Microsoft Defender to leave the install folder alone (it flags
@@ -7,7 +7,9 @@
 # app's hotspotctl: it counts, limits and blocks the devices' traffic and gives out their addresses)
 # and WinDivert (https://reqrypt.org/windivert.html, LGPL), the driver the helper works through; and
 # in the Start menu and on the desktop. Your settings stay in %APPDATA%\Hotspot Manager.
-param([switch]$Uninstall, [switch]$Elevated, [switch]$AllowWinDivert)
+# The setup program (packaging\hotspot-manager.iss) runs it too, with -Quiet -NoShortcuts: no
+# "Press Enter" at the end, and the shortcuts are its own.
+param([switch]$Uninstall, [switch]$Elevated, [switch]$AllowWinDivert, [switch]$Quiet, [switch]$NoShortcuts)
 $ErrorActionPreference = "Stop"
 $dir = Join-Path $env:ProgramFiles "Hotspot Manager"
 $exe = Join-Path $dir "hotspot-manager.exe"
@@ -109,9 +111,9 @@ try {
     Step "Starting the helper service"
     Start-Service $service
 
-    Step "Adding Hotspot Manager to the Start menu and the desktop"
+    if (-not $NoShortcuts) { Step "Adding Hotspot Manager to the Start menu and the desktop" }
     $shell = New-Object -ComObject WScript.Shell
-    foreach ($path in $links) {
+    foreach ($path in @($links | Where-Object { -not $NoShortcuts })) {
         $link = $shell.CreateShortcut($path)
         $link.TargetPath = $exe
         $link.WorkingDirectory = $dir
@@ -128,5 +130,6 @@ try {
     Write-Host "Hotspot Manager is installed." -ForegroundColor Green
 } catch {
     Write-Host "Installing failed: $($_.Exception.Message)" -ForegroundColor Red
+    if ($Quiet) { exit 1 }
 }
-Read-Host "Press Enter to close"
+if (-not $Quiet) { Read-Host "Press Enter to close" }
