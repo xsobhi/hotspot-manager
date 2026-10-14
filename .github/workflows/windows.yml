@@ -1,0 +1,87 @@
+# Hotspot Manager for Windows: built, tested and packaged (Inno Setup) on every push to the
+# windows branch; a version tag also publishes it as a GitHub release:
+#   git tag windows-v1.0.0 && git push origin windows-v1.0.0
+name: Windows
+on:
+  push:
+    branches: [windows]
+    tags: ["windows-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build, installer, install test
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Installer (Inno Setup)
+        run: |
+          choco install innosetup -y --no-progress
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DVersion=$version" packaging\hotspot-manager.iss
+          if ($LASTEXITCODE) { throw "installer build failed" }
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item target\release\hotspot-manager.exe, install.ps1 portable
+          Compress-Archive -Path portable\* -DestinationPath "dist\HotspotManager-$version-windows-x64-portable.zip"
+          Get-ChildItem dist
+      - name: Install test (silent install, the helper service, then uninstall)
+        run: |
+          $setup = Get-Item dist\*-setup.exe
+          $install = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          if (-not $install.WaitForExit(600000)) { throw "the silent install didn't finish" }
+          $dir = "$env:ProgramFiles\Hotspot Manager"
+          if (-not (Test-Path "$dir\hotspot-manager.exe")) { throw "not installed in Program Files" }
+          Start-Sleep 5
+          $service = Get-Service HotspotManager -ErrorAction SilentlyContinue
+          if (-not $service -or $service.Status -ne "Running") { throw "the helper service isn't running" }
+          Get-ChildItem $dir | Format-Table Name, Length
+          Get-Content "$env:ProgramData\Hotspot Manager\helper.log"
+          if (-not (Select-String -Path "$env:ProgramData\Hotspot Manager\helper.log" -Pattern "Helper started" -Quiet)) {
+            throw "the helper didn't start"
+          }
+          # uninstall (the uninstaller copies itself away and returns at once: wait for the service to go)
+          Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          foreach ($i in 1..60) {
+            if (-not (Get-Service HotspotManager -ErrorAction SilentlyContinue) -and -not (Test-Path "$dir\hotspot-manager.exe")) { break }
+            Start-Sleep 2
+          }
+          if (Get-Service HotspotManager -ErrorAction SilentlyContinue) { throw "the uninstaller left the service" }
+          if (Test-Path "$dir\hotspot-manager.exe") { throw "the uninstaller left the app" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            windows/dist/*.exe
+            windows/dist/*.zip
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/windows-v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: artifacts
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF_NAME}
+          gh release create "$tag" --title "Hotspot Manager for Windows ${tag#windows-v}" \
+            --notes-file windows/packaging/release-notes.md artifacts/*
