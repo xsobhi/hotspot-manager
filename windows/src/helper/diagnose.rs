@@ -55,7 +55,8 @@ pub fn diagnose(gateway: Ip, hotspot: u32) {
     let after = shared().lock().unwrap().counts;
     for (i, name) in ["up", "down"].iter().enumerate() {
         let (a, b) = (after[i], before[i]);
-        log::line(format!("Diagnosis, the engine's packets {name}: {} seen, {} sent at once, {} queued, {} released, {} dropped",
-                          a.seen - b.seen, a.sent - b.sent, a.queued - b.queued, a.released - b.released, a.dropped - b.dropped));
+        log::line(format!("Diagnosis, the engine's packets {name}: {} seen, {} sent at once, {} queued, {} released, \
+                           {} dropped, {} not matched to a device", a.seen - b.seen, a.sent - b.sent, a.queued - b.queued,
+                          a.released - b.released, a.dropped - b.dropped, a.unknown - b.unknown));
     }
 }
