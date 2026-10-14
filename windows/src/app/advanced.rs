@@ -1,7 +1,9 @@
-//! Settings → Advanced, as the Linux app's: Wi-Fi (channel, width, country, max devices, hidden,
-//! devices kept apart), Network (the hotspot's address, the DHCP range, lease time, DNS servers)
-//! and Troubleshooting. What Windows' hotspot decides itself is shown, greyed, with why.
+//! Settings → Advanced, as the Linux app's: Wi-Fi (channel, width and mode from the adapter's
+//! driver (radio.rs), country, max devices, hidden, devices kept apart), Network (the hotspot's
+//! address, the DHCP range, lease time, DNS servers) and Troubleshooting. What Windows decides
+//! itself is shown, greyed, with why.
 
+use super::radio::{self, Found, Radio};
 use super::{logview, setup, App};
 use crate::helper::dhcp::parse_ip;
 use crate::hotspot::{self, State};
@@ -22,7 +24,17 @@ fn ip_text(ip: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
 
+/// Open it once the adapter's driver settings are known (PowerShell takes a moment).
 pub fn open(app: &Rc<App>) {
+    let chosen = app.store.borrow().adapter_id();
+    app.say("Reading the Wi-Fi adapter's settings…", false);
+    worker::run(move || {
+        let found = radio::find(chosen);
+        super::post(move |app| show(app, found));
+    });
+}
+
+fn show(app: &Rc<App>, found: Found) {
     let rules = app.rules.borrow().clone();
     let net_rules = rules.as_ref().map(|r| r.network.clone()).unwrap_or_default();
     let gateway = net::gateway();
@@ -34,13 +46,12 @@ pub fn open(app: &Rc<App>) {
         note
     };
     let wifi = heading("Wi-Fi");
-    let channel = window.choice(&["Automatic (Windows picks it)"], 0, |_| {});
-    let width = window.choice(&["Automatic (the adapter's driver picks it)"], 0, |_| {});
+    let radio = Rc::new(Radio::new(&window, &found));
     let country = window.edit("From Windows' region settings", || {});
     let max = window.spin(0, 8, rules.as_ref().map_or(0, |r| r.max_devices as i32), |_| {});
     let hidden = window.checkbox("Hide network name", false, |_| {});
     let isolate = window.checkbox("Stop connected devices from seeing each other", rules.as_ref().is_some_and(|r| r.isolate), |_| {});
-    let windows_note = dim("Windows' hotspot picks its channel, width and country itself, can't hide its name, and takes up to 8 devices.");
+    let windows_note = dim("Windows' hotspot takes the country from Windows' region, can't hide its name, and takes up to 8 devices.");
     let network = heading("Network");
     let network_note = dim("Devices get an address from the DHCP range, with the hotspot IP as their gateway.");
     let range = |n: u8| ip_text([gateway[0], gateway[1], gateway[2], n]);
@@ -74,7 +85,7 @@ pub fn open(app: &Rc<App>) {
 
     let w = window.clone();
     let cancel = window.button("Cancel", move || w.destroy());
-    let (a, w) = (app.clone(), window.clone());
+    let (a, w, r) = (app.clone(), window.clone(), radio.clone());
     let save = window.default_button("Save", move || {
         let parsed = (parse_ip(&text(gw)), parse_ip(&text(from)), parse_ip(&text(to)));
         let (Some(g), Some(f), Some(t)) = parsed else {
@@ -94,6 +105,10 @@ pub fn open(app: &Rc<App>) {
         if g != net::gateway() {
             move_hotspot(&a, g);
         }
+        let driver = r.changes();
+        if !driver.is_empty() {
+            set_driver(&a, driver);
+        }
         w.destroy();
     });
     let w = window.clone();
@@ -109,8 +124,7 @@ pub fn open(app: &Rc<App>) {
     };
     place(wifi, 20, y, 200, 22);
     y += 30;
-    row("Channel", channel, 300, &mut y);
-    row("Channel width", width, 300, &mut y);
+    y = radio.place(20, NAMES, X, WIDTH, y);
     row("Country", country, 300, &mut y);
     row("Max devices (0 = no limit)", max, 140, &mut y);
     place(hidden, X, y, 380, 26);
@@ -144,7 +158,7 @@ pub fn open(app: &Rc<App>) {
     place(cancel, WIDTH - 20 - 2 * 104 - 8, y, 104, FIELD + 2);
     place(save, WIDTH - 20 - 104, y, 104, FIELD + 2);
     wnd::set_client_height(window.hwnd(), y + FIELD + 2 + 18);
-    for fixed in [channel, width, country, hidden, mask] {
+    for fixed in [country, hidden, mask] {
         enable(fixed, false);
     }
     for needs_helper in [max, isolate, gw, from, to, lease, dns, save] {
@@ -152,6 +166,33 @@ pub fn open(app: &Rc<App>) {
     }
     wnd::center(window.hwnd());
     window.show();
+}
+
+/// Change the adapter's driver settings (the helper does: they need administrator rights); the
+/// adapter restarts, so the hotspot is turned on again after.
+fn set_driver(app: &Rc<App>, changes: Vec<(String, String, String)>) {
+    let was_on = app.state() == Some(State::On);
+    let adapter = app.store.borrow().adapter_id();
+    app.busy.set(Some("Changing the adapter's settings…"));
+    app.update();
+    worker::run(move || {
+        let mut result = Ok(());
+        for (name, keyword, value) in &changes {
+            result = result.and_then(|()| client::set_driver(name, keyword, value));
+        }
+        if was_on {
+            std::thread::sleep(std::time::Duration::from_secs(4)); // (the adapter coming back)
+            result = result.and_then(|()| hotspot::switch(adapter, true));
+        }
+        super::post(move |app| {
+            app.busy.set(None);
+            match result {
+                Ok(()) => app.say("The adapter's settings are changed.", false),
+                Err(why) => app.say(why, true),
+            }
+            app.refresh();
+        });
+    });
 }
 
 /// The hotspot's new address: the helper sets it, then the hotspot restarts with it (if it's on).

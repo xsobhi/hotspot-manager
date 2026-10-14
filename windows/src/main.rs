@@ -12,6 +12,7 @@
 
 mod app;
 mod client;
+mod driver;
 mod helper;
 mod hotspot;
 mod local;

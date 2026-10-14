@@ -10,6 +10,7 @@ mod everyone;
 mod list;
 mod logview;
 mod qr;
+mod radio;
 mod rows;
 mod settings;
 mod setup;

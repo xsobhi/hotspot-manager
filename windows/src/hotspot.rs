@@ -77,6 +77,11 @@ fn network_adapter(id: GUID) -> Option<NetworkAdapter> {
         .find(|a| a.NetworkAdapterId().ok() == Some(id))
 }
 
+/// The adapter of the internet connection (the PC's Wi-Fi, say), if there is one.
+pub fn internet_adapter() -> Option<GUID> {
+    NetworkInformation::GetInternetConnectionProfile().and_then(|p| p.NetworkAdapter()).and_then(|a| a.NetworkAdapterId()).ok()
+}
+
 /// Is there an internet connection to share?
 pub fn online() -> bool {
     NetworkInformation::GetInternetConnectionProfile().is_ok()

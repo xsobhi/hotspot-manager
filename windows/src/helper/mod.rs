@@ -122,16 +122,23 @@ pub fn run(stop: &AtomicBool) {
 /// Every two seconds: follow the hotspot (on, off, its adapter), who's on it, and the rules.
 fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     let adapter = net::hotspot_adapter();
-    // the address Windows really gave the hotspot (the one asked for applies from its next start)
-    let gateway = adapter.as_ref().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
-        .unwrap_or_else(net::gateway);
+    // The hotspot's address: Windows' mobile hotspot keeps its own (192.168.137.1), so another one
+    // asked for is added to its adapter, and the helper gives out addresses next to it; Windows'
+    // DNS proxy stays at its own address.
+    let wanted = net::gateway();
+    let windows_own = adapter.as_ref().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254] && *ip != wanted))
+        .unwrap_or(wanted);
+    let gateway = wanted;
+    if let Some(a) = adapter.as_ref().filter(|a| windows_own != wanted && !a.ipv4.contains(&wanted)) {
+        add_address(a, wanted);
+    }
     let same = |r: &Running| adapter.as_ref().is_some_and(|a| a.index == r.hotspot) && r.gateway == gateway;
     if running.as_ref().is_some_and(|r| !same(r)) {
         running.take().unwrap().stop();
         log::line("The hotspot is off");
     }
     let Some(adapter) = adapter else { return };
-    let own_dhcp = shared.lock().unwrap().rules.network.own_dhcp();
+    let own_dhcp = shared.lock().unwrap().rules.network.own_dhcp() || gateway != windows_own;
     let r = running.get_or_insert_with(|| {
         log::line(format!("The hotspot is on: {} ({})", adapter.friendly, adapter.name));
         let engine = Engine::start(shared.clone(), gateway);
@@ -146,7 +153,7 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
         if let Some(d) = r.dhcp.take() {
             d.stop();
         } else {
-            match dhcpd::DhcpServer::start(shared.clone(), gateway, adapter.index) {
+            match dhcpd::DhcpServer::start(shared.clone(), gateway, windows_own, adapter.index) {
                 Ok(d) => r.dhcp = Some(d),
                 Err(e) => log::line(format!("Can't give out addresses: {e}")),
             }
@@ -166,6 +173,18 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>) {
     }
     let time = now();
     s.rules.cut.retain(|_, until| *until > time);
+}
+
+/// Give the hotspot's adapter another address (Windows' own stays too).
+fn add_address(adapter: &net::Adapter, ip: Ip) {
+    use std::os::windows::process::CommandExt;
+    let address = format!("address={}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let name = format!("name={}", adapter.friendly);
+    let done = std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "add", "address", &name, &address, "mask=255.255.255.0"])
+        .creation_flags(0x0800_0000) // no console window
+        .status().is_ok_and(|s| s.success());
+    log::line(if done { format!("Added the hotspot's address {}", &address[8..]) } else { format!("Couldn't add {} to the hotspot", &address[8..]) });
 }
 
 /// The helper in a console window (as administrator), for trying it out: `--helper`.
