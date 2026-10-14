@@ -89,7 +89,8 @@ fn paint(p: &Painter, app: &App) {
                 0 => "no devices yet".to_string(),
                 n => format!("{n} of {} devices", s.max_clients),
             };
-            (format!("“{}”  ·  {devices}  ·  ↓ {}  ↑ {}", s.ssid, rate(down), rate(up)), theme::DIM)
+            let on = app.radio.borrow().as_ref().map(|r| format!("on {r}  ·  ")).unwrap_or_default();
+            (format!("“{}”  ·  {on}{devices}  ·  ↓ {}  ↑ {}", s.ssid, rate(down), rate(up)), theme::DIM)
         }
         (None, _, Some(s)) => (format!("“{}”  ·  turn it on to share this PC's internet", s.ssid), theme::DIM),
         _ => (String::new(), theme::DIM),
@@ -104,6 +105,9 @@ impl App {
         self.update();
         let adapter = self.store.borrow().adapter_id();
         worker::run(move || {
+            if on {
+                let _ = crate::client::steer(adapter); // on the adapter chosen (without the helper: where Windows likes)
+            }
             let result = hotspot::switch(adapter, on);
             post(move |app| {
                 app.busy.set(None);

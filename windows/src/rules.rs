@@ -70,6 +70,7 @@ pub struct Rules {
     pub blocked: BTreeSet<String>,
     pub cut: BTreeMap<String, u64>,      // MAC → cut off until (unix seconds): "Disconnect"
     pub isolate: bool,                   // devices can't reach each other
+    pub local_only: bool,                // "Share internet" off: they reach each other and the PC only
     pub max_devices: u32,                // 0 = no limit (Windows allows 8 at most)
     pub network: Network,
 }

@@ -2,7 +2,7 @@
 //! the helper has administrator rights, the window doesn't.
 
 use super::dhcp::parse_ip;
-use super::{engine, ics, log, save, shared};
+use super::{diagnose, ics, log, save, shared};
 use crate::net;
 use crate::rules::{HelperStatus, Rules, Usage};
 use serde::Deserialize;
@@ -17,6 +17,7 @@ pub enum Request {
     Log,
     Gateway { gateway: String },
     SetDriver { adapter: String, keyword: String, value: String },
+    Steer { adapter: Option<String> },
     Diagnose,
 }
 
@@ -70,9 +71,14 @@ fn handle(request: Request) -> Result<Value, String> {
             log::line(format!("{adapter}: {keyword} is now {value}"));
             Ok(json!(true))
         }
+        Request::Steer { adapter } => {
+            let id = adapter.map(|a| windows::core::GUID::try_from(a.as_str()).map_err(|_| "That isn't an adapter".to_string())).transpose()?;
+            super::steer::steer(id)?;
+            Ok(json!(true))
+        }
         Request::Diagnose => {
             let hotspot = net::hotspot_adapter().ok_or("The hotspot isn't on")?;
-            std::thread::spawn(move || engine::diagnose(net::gateway(), hotspot.index));
+            std::thread::spawn(move || diagnose::diagnose(net::gateway(), hotspot.index));
             Ok(json!(true))
         }
     }

@@ -69,6 +69,7 @@ pub struct Adapter {
     pub up: bool,
     pub wifi: bool, // a Wi-Fi adapter itself (not Windows' virtual ones on it)
     pub ipv4: Vec<[u8; 4]>,
+    pub mac: [u8; 6],
 }
 
 /// Every network adapter, with its addresses.
@@ -114,6 +115,7 @@ pub fn adapters() -> Vec<Adapter> {
                     up: a.OperStatus == IfOperStatusUp,
                     wifi: a.IfType == IF_TYPE_IEEE80211 && !virtual_adapter(&a.Description.to_string().unwrap_or_default()),
                     ipv4,
+                    mac: a.PhysicalAddress[..6].try_into().unwrap_or_default(),
                 });
             }
             next = a.Next;
@@ -124,6 +126,36 @@ pub fn adapters() -> Vec<Adapter> {
 
 fn virtual_adapter(description: &str) -> bool {
     description.contains("Virtual") || description.contains("Wi-Fi Direct")
+}
+
+/// The Wi-Fi adapter a Wi-Fi Direct adapter belongs to: the one with its MAC address, or the
+/// "locally administered" twin of it (the second bit of the first byte set).
+pub fn radio_of(virtual_mac: [u8; 6]) -> Option<Adapter> {
+    adapters().into_iter().find(|a| a.wifi && a.mac[1..] == virtual_mac[1..] && (a.mac[0] | 2) == (virtual_mac[0] | 2))
+}
+
+/// Which Wi-Fi adapter hosts the hotspot now ("Wi-Fi 2").
+pub fn hosting_radio() -> Option<Adapter> {
+    radio_of(hotspot_adapter()?.mac)
+}
+
+/// The Wi-Fi adapters whose driver lets Windows host a hotspot on 5 GHz ("P2P GO on 5 GHz"), by
+/// their names ("Wi-Fi 2").
+pub fn hosts_on_5ghz() -> Vec<(String, bool)> {
+    use std::os::windows::process::CommandExt;
+    let Ok(out) = std::process::Command::new("netsh").args(["wlan", "show", "wirelesscapabilities"])
+        .creation_flags(0x0800_0000).output() else { return vec![] };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = vec![];
+    let mut name = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(n) = line.strip_prefix("Interface name:") {
+            name = Some(n.trim().to_string());
+        } else if line.starts_with("P2P GO on 5 GHz") && let Some(n) = name.take() {
+            found.push((n, !line.contains("Not")));
+        }
+    }
+    found
 }
 
 /// Bytes (sent to the devices, received from them) through the hotspot so far, while it's on.
