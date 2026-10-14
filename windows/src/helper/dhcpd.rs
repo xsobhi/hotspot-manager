@@ -31,6 +31,9 @@ impl DhcpServer {
                     s.macs.insert(ip, mac.clone());
                     super::save("leases.json", &s.leases);
                     let name = request.hostname.clone().unwrap_or_default();
+                    if !name.is_empty() {
+                        s.hosts.insert(mac.clone(), name.clone());
+                    }
                     log::line(format!("Gave {}.{}.{}.{} to {mac} {name}", ip[0], ip[1], ip[2], ip[3]));
                 }
                 drop(s);

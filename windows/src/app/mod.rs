@@ -92,6 +92,13 @@ impl App {
     }
 
     fn got(&self, status: Result<Status, String>, helper: Result<HelperStatus, String>) {
+        let mut status = status;
+        if let (Ok(s), Ok(h)) = (&mut status, &helper) {
+            // the names devices gave the helper's DHCP (Windows only knows its own DHCP's)
+            for c in s.clients.iter_mut().filter(|c| c.host.is_none()) {
+                c.host = h.usage.iter().find(|u| u.mac == c.mac && !u.host.is_empty()).map(|u| u.host.clone());
+            }
+        }
         if let Ok(s) = &status {
             let mut store = self.store.borrow_mut();
             let renamed = !s.local && (store.ssid != s.ssid || store.passphrase != s.passphrase);

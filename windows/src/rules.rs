@@ -90,6 +90,7 @@ pub struct Usage {
     pub ip: String,
     pub down_bytes: u64, // to the device, since the helper started
     pub up_bytes: u64,
+    pub host: String, // the name it gave DHCP
     pub down_rate: f64, // bits a second, now
     pub up_rate: f64,
 }
