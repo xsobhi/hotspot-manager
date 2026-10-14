@@ -17,6 +17,40 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
 - **QR code** button: a code your phone camera can scan to join, plus the name and password
 - **Log** tab, so you can see why it failed to start
 
+## Windows
+
+There's a Windows version too, in [`windows/`](windows): a native app (Rust, ~2 MB) on Windows' own
+**Mobile hotspot**, with the same look as on Linux Mint. It can put the hotspot on the adapter you pick, so a
+**USB Wi-Fi dongle hosts it** while the PC's own Wi-Fi keeps its internet connection.
+
+| Devices | Settings |
+|---|---|
+| ![Devices](docs/windows-devices.png) | ![Settings](docs/windows-settings.png) |
+
+- **On/off switch**, its state, how many devices are on it and its live speed (↓ to the devices, ↑ from them)
+- **Name, password** (show it, or generate a new one) and **band** (2.4 / 5 GHz, where Windows and the adapter
+  allow it), and **which Wi-Fi adapter** hosts it
+- **Devices**: the ones connected now and, if you like, the ones that have been, with the name they give, IP and
+  MAC address, and how long they've been connected. Click one to give it a name you'll recognise, or to forget it
+- **QR code** to join from a phone's camera
+- **Turn on when I sign in**
+- Nothing needs administrator rights, and the hotspot keeps running when the window is closed
+
+Windows decides the rest itself: it shares the PC's internet connection (ICS, devices get `192.168.137.x`), up
+to 8 devices, on a channel and width the adapter's driver picks. Per-device speed limits, blocking devices and
+data used per device need a packet filter driver on Windows; they aren't in it yet.
+
+**Install** (Windows 10 2004 or later): with [Rust](https://rustup.rs) installed,
+
+```powershell
+git clone https://github.com/xsobhi/hotspot-manager-linux
+cd hotspot-manager-linux
+powershell -ExecutionPolicy Bypass -File windows\install.ps1
+```
+
+That builds it and adds **Hotspot Manager** to the Start menu and the desktop, for your user only
+(`windows\install.ps1 -Uninstall` removes it). `hotspot-manager --turn-on` turns the hotspot on without a window.
+
 ## Why not NetworkManager's built-in hotspot?
 
 NetworkManager (≤ 1.50) always starts its hotspot at **20 MHz** width. On 5 GHz that caps a phone's
@@ -42,14 +76,14 @@ Tested on an MSI Katana 15 B13VFK with a **TP-Link Archer T4U v3** (RTL8812BU, i
 driver) as the hotspot, the built-in Intel AX201 as the internet connection, Linux Mint 22.3 (Cinnamon),
 kernel 7.0.
 
-## Requirements
+## Requirements (Linux)
 
 - A Wi-Fi adapter that supports AP mode (the adapter list in Settings shows this), **separate from the one
   that carries your internet**
 - Debian/Ubuntu/Mint (the installer uses apt). On other distros, install `hostapd iw dnsmasq iptables
   qrencode` and PyGObject with GTK 3, then run the installer.
 
-## Install
+## Install (Linux)
 
 ```sh
 git clone https://github.com/xsobhi/hotspot-manager-linux
