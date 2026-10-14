@@ -53,7 +53,8 @@ pub fn keep_to_band(adapter: GUID, band: Band) -> Result<bool, String> {
     let Some(mode) = driver::properties(&a.name).into_iter().find(|p| driver::kind(p) == Some(Kind::Mode)) else {
         return Ok(false);
     };
-    if band == Band::Any && !driver::single_band(&mode.value) {
+    // (any band: only a single band is undone; a band: one kept to it already stays, at its width)
+    if band == Band::Any && !driver::single_band(&mode.value) || driver::band_of(&mode.value) == Some(band) {
         return Ok(false);
     }
     let Some((value, shown)) = driver::mode_for(&mode, band) else { return Ok(false) };

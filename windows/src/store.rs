@@ -13,6 +13,7 @@ pub struct Store {
     pub adapter: Option<String>, // network adapter id of the Wi-Fi adapter to host on
     pub ssid: String,            // the hotspot's name and password, for the local-only hotspot
     pub passphrase: String,      // (Windows keeps them for its own, but asks for an internet connection)
+    pub band: String,            // the band chosen ("5", "2.4", "any"; "" before): the app's own hotspot's
     pub devices: BTreeMap<String, Device>,
 }
 

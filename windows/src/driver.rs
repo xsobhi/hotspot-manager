@@ -55,6 +55,13 @@ pub fn kind(p: &Property) -> Option<Kind> {
     }
 }
 
+/// The 802.11 standards a Wireless Mode choice names: "IEEE 802.11a/n/ac" → a, n, ac.
+fn standards(choice: &str) -> Vec<String> {
+    let lower = choice.to_lowercase();
+    let Some(at) = lower.find("802.11") else { return vec![] };
+    lower[at + 6..].split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
 /// Which band a Wireless Mode choice keeps the adapter to, if one ("IEEE 802.11a/n/ac": 5 GHz,
 /// "IEEE 802.11b/g/n": 2.4 GHz, "Auto" or "802.11a/b/g": none), and how many standards it has.
 fn reach(choice: &str) -> (Option<Band>, usize) {
@@ -67,8 +74,7 @@ fn reach(choice: &str) -> (Option<Band>, usize) {
             return (Some(Band::Five), 1);
         }
     }
-    let Some(at) = lower.find("802.11") else { return (None, 0) };
-    let standards: Vec<&str> = lower[at + 6..].split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    let standards = standards(choice);
     let five = standards.iter().any(|s| *s == "a" || *s == "ac");
     let two = standards.iter().any(|s| *s == "b" || *s == "g");
     let band = match (five, two) {
@@ -82,6 +88,41 @@ fn reach(choice: &str) -> (Option<Band>, usize) {
 /// Does this Wireless Mode choice keep the adapter to one band?
 pub fn single_band(choice: &str) -> bool {
     reach(choice).0.is_some()
+}
+
+/// The band a Wireless Mode choice keeps the adapter to, if one.
+pub fn band_of(choice: &str) -> Option<Band> {
+    reach(choice).0
+}
+
+/// The widest channel a Wireless Mode choice allows: 802.11ac 80 MHz, n 40, a/b/g 20.
+pub fn width_of(choice: &str) -> Option<u32> {
+    let s = standards(choice);
+    let has = |x: &str| s.iter().any(|t| t == x);
+    match () {
+        _ if s.is_empty() => None,
+        _ if has("ac") || has("ax") => Some(80),
+        _ if has("n") => Some(40),
+        _ => Some(20),
+    }
+}
+
+/// For a driver without a width setting: the widths its Wireless Mode allows on the band it keeps
+/// to now, widest first, each with the mode for it (the index of its choice). None on "Auto".
+pub fn widths(mode: &Property) -> Vec<(u32, usize)> {
+    let Some(band) = band_of(&mode.value) else { return vec![] };
+    let mut found: Vec<(u32, usize, usize)> = vec![]; // (MHz, choice, standards: the most capable wins)
+    for (i, choice) in mode.choices().iter().enumerate() {
+        let (b, n) = reach(choice);
+        let Some(mhz) = width_of(choice).filter(|_| b == Some(band)) else { continue };
+        match found.iter_mut().find(|f| f.0 == mhz) {
+            Some(f) if f.2 >= n => {}
+            Some(f) => *f = (mhz, i, n),
+            None => found.push((mhz, i, n)),
+        }
+    }
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    found.into_iter().map(|(mhz, i, _)| (mhz, i)).collect()
 }
 
 /// The Wireless Mode choice for the hotspot's band: the most capable one kept to that band, or for
@@ -177,5 +218,11 @@ mod tests {
         assert_eq!(mode_for(&intel, Band::Five), Some(("1".into(), "1. 802.11a".into())));
         assert_eq!(mode_for(&intel, Band::Any), Some(("6".into(), "6. 802.11a/b/g".into())));
         assert!(single_band("IEEE 802.11a/n/ac") && single_band("5GHz only") && !single_band("Auto") && !single_band("6. 802.11a/b/g"));
+        // widths through the mode, on the band it's kept to
+        let five = Property { value: "IEEE 802.11a/n/ac".into(), ..tp_link.clone() };
+        assert_eq!(widths(&five), vec![(80, 6), (40, 5), (20, 1)]);
+        let two = Property { value: "IEEE 802.11b/g/n".into(), ..tp_link.clone() };
+        assert_eq!(widths(&two), vec![(40, 4), (20, 3)]);
+        assert!(widths(&tp_link).is_empty()); // Auto: any band
     }
 }
