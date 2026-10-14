@@ -9,7 +9,6 @@
   #define Version "0.0.0"
 #endif
 #define Art(Name) "art\" + Name + "-100.bmp,art\" + Name + "-125.bmp,art\" + Name + "-150.bmp,art\" + Name + "-175.bmp,art\" + Name + "-200.bmp,art\" + Name + "-250.bmp"
-#define Setup "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -Elevated -Quiet -NoShortcuts"
 
 [Setup]
 AppId={{94F06B60-F91B-4DA5-8C56-CF41C4F9BDC3}
@@ -66,8 +65,8 @@ Name: "{autodesktop}\Hotspot Manager"; Filename: "{app}\hotspot-manager.exe"
 
 [Run]
 ; the helper service and WinDivert
-Filename: "powershell.exe"; Parameters: "{#Setup}"; StatusMsg: "Setting up the helper service and WinDivert..."; Flags: runhidden; Tasks: not defender
-Filename: "powershell.exe"; Parameters: "{#Setup} -AllowWinDivert"; StatusMsg: "Setting up the helper service and WinDivert..."; Flags: runhidden; Tasks: defender
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -Elevated -Quiet -NoShortcuts"; StatusMsg: "Setting up the helper service and WinDivert..."; Flags: runhidden; Tasks: not defender
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -Elevated -Quiet -NoShortcuts -AllowWinDivert"; StatusMsg: "Setting up the helper service and WinDivert..."; Flags: runhidden; Tasks: defender
 Filename: "{app}\hotspot-manager.exe"; Description: "Open Hotspot Manager"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
