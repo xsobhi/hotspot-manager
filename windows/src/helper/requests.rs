@@ -16,6 +16,7 @@ pub enum Request {
     SetRules { rules: Rules },
     Log,
     Gateway { gateway: String },
+    SetDriver { adapter: String, keyword: String, value: String },
     Diagnose,
 }
 
@@ -58,6 +59,15 @@ fn handle(request: Request) -> Result<Value, String> {
             let ip = parse_ip(&gateway).ok_or("That isn't an IP address")?;
             ics::set_gateway(ip)?;
             log::line(format!("The hotspot's address is now {gateway} (from when it next starts)"));
+            Ok(json!(true))
+        }
+        Request::SetDriver { adapter, keyword, value } => {
+            // only a Wi-Fi adapter's, and only a choice its driver offers (driver.rs checks)
+            if !net::adapters().iter().any(|a| a.wifi && a.name == adapter) {
+                return Err("That isn't one of this PC's Wi-Fi adapters".into());
+            }
+            crate::driver::set(&adapter, &keyword, &value)?;
+            log::line(format!("{adapter}: {keyword} is now {value}"));
             Ok(json!(true))
         }
         Request::Diagnose => {

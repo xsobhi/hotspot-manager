@@ -41,6 +41,11 @@ pub fn set_gateway(gateway: &str) -> Result<(), String> {
     call::<bool>(json!({ "do": "gateway", "gateway": gateway })).map(|_| ())
 }
 
+/// Change one of a Wi-Fi adapter's driver settings (driver.rs).
+pub fn set_driver(adapter: &str, keyword: &str, value: &str) -> Result<(), String> {
+    call::<bool>(json!({ "do": "set_driver", "adapter": adapter, "keyword": keyword, "value": value })).map(|_| ())
+}
+
 pub fn diagnose() -> Result<(), String> {
     call::<bool>(json!({ "do": "diagnose" })).map(|_| ())
 }

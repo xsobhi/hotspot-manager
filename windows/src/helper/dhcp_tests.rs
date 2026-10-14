@@ -30,7 +30,7 @@ fn offers_then_acks_in_range() {
     assert_eq!(answer(&req, &net, gw, &mut leases, 1000), Some((ACK, ip)));
     let wrong = parse(&request(REQUEST, Some([192, 168, 137, 99]))).unwrap();
     assert_eq!(answer(&wrong, &net, gw, &mut leases, 1000).map(|a| a.0), Some(NAK));
-    let packet = reply(&req, ACK, ip, gw, &net);
+    let packet = reply(&req, ACK, ip, gw, gw, &net);
     assert_eq!(packet.len(), 20 + 8 + 300);
     assert_eq!(&packet[16..20], &[255; 4]);
 }

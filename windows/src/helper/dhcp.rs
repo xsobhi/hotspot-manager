@@ -127,7 +127,7 @@ pub fn answer(req: &Request, net: &Network, gateway: Ip, leases: &mut Leases, no
 }
 
 /// The reply as a whole IPv4 packet from the hotspot (checksums left for WinDivert to fill in).
-pub fn reply(req: &Request, kind: u8, yiaddr: Ip, gateway: Ip, net: &Network) -> Vec<u8> {
+pub fn reply(req: &Request, kind: u8, yiaddr: Ip, gateway: Ip, dns: Ip, net: &Network) -> Vec<u8> {
     let mut bootp = vec![0u8; 240];
     bootp[0] = 2; // a reply
     bootp[1] = 1;
@@ -156,8 +156,8 @@ pub fn reply(req: &Request, kind: u8, yiaddr: Ip, gateway: Ip, net: &Network) ->
         }
         option(1, &[255, 255, 255, 0]);
         option(3, &gateway);
-        let dns: Vec<u8> = net.dns.iter().filter_map(|d| parse_ip(d)).take(3).flatten().collect();
-        option(6, if dns.is_empty() { &gateway } else { &dns });
+        let servers: Vec<u8> = net.dns.iter().filter_map(|d| parse_ip(d)).take(3).flatten().collect();
+        option(6, if servers.is_empty() { &dns } else { &servers });
     }
     bootp.push(255);
     bootp.resize(bootp.len().max(300), 0); // the smallest BOOTP message

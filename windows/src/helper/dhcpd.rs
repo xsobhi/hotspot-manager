@@ -13,7 +13,8 @@ pub struct DhcpServer {
 }
 
 impl DhcpServer {
-    pub fn start(shared: Arc<Mutex<Shared>>, gateway: Ip, hotspot: u32) -> Result<DhcpServer, String> {
+    /// Answer on the hotspot's adapter; `dns`: the DNS server to give when none is set.
+    pub fn start(shared: Arc<Mutex<Shared>>, gateway: Ip, dns: Ip, hotspot: u32) -> Result<DhcpServer, String> {
         let filter = format!("inbound and ifIdx == {hotspot} and ip and udp and udp.DstPort == 67");
         let divert = Arc::new(Divert::open(&filter, LAYER_NETWORK, 0)?);
         let d = divert.clone();
@@ -33,7 +34,7 @@ impl DhcpServer {
                     log::line(format!("Gave {}.{}.{}.{} to {mac} {name}", ip[0], ip[1], ip[2], ip[3]));
                 }
                 drop(s);
-                let mut packet = dhcp::reply(&request, kind, ip, gateway, &net);
+                let mut packet = dhcp::reply(&request, kind, ip, gateway, dns, &net);
                 let mut address = Address::default();
                 address.if_idx = hotspot;
                 address.set_layer(LAYER_NETWORK);
