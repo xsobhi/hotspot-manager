@@ -24,7 +24,8 @@ pub enum Band {
     Five,
 }
 
-pub const BANDS: [(Band, &str); 3] = [(Band::Any, "Any available"), (Band::TwoPointFour, "2.4 GHz"), (Band::Five, "5 GHz")];
+pub const BANDS: [(Band, &str); 3] = [(Band::Any, "Any available"), (Band::Five, "5 GHz (faster)"),
+                                      (Band::TwoPointFour, "2.4 GHz (longer range, older devices)")];
 
 #[derive(Clone, Debug)]
 pub struct Client {

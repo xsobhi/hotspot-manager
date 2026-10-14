@@ -19,26 +19,39 @@ A desktop app for running a **fast 5 GHz Wi-Fi hotspot** on Linux from a second 
 
 ## Windows
 
-There's a Windows version too, in [`windows/`](windows): a native app (Rust, ~2 MB) on Windows' own
-**Mobile hotspot**, with the same look as on Linux Mint. It can put the hotspot on the adapter you pick, so a
-**USB Wi-Fi dongle hosts it** while the PC's own Wi-Fi keeps its internet connection.
+There's a Windows version too, in [`windows/`](windows): a native app (Rust, ~3 MB) on Windows' own
+**Mobile hotspot**, with the same controls as the Linux app and the look of Linux Mint. It can put the hotspot on
+the adapter you pick, so a **USB Wi-Fi dongle hosts it** while the PC's own Wi-Fi keeps its internet connection.
 
-| Devices | Settings |
-|---|---|
-| ![Devices](docs/windows-devices.png) | ![Settings](docs/windows-settings.png) |
+| A device | Settings | Advanced |
+|---|---|---|
+| ![A device](docs/windows-device.png) | ![Settings](docs/windows-settings.png) | ![Advanced](docs/windows-advanced.png) |
 
-- **On/off switch**, its state, how many devices are on it and its live speed (↓ to the devices, ↑ from them)
-- **Name, password** (show it, or generate a new one) and **band** (2.4 / 5 GHz, where Windows and the adapter
-  allow it), and **which Wi-Fi adapter** hosts it
-- **Devices**: the ones connected now and, if you like, the ones that have been, with the name they give, IP and
-  MAC address, and how long they've been connected. Click one to give it a name you'll recognise, or to forget it
-- **QR code** to join from a phone's camera
-- **Turn on when I sign in**
-- Nothing needs administrator rights, and the hotspot keeps running when the window is closed
+As on Linux:
 
-Windows decides the rest itself: it shares the PC's internet connection (ICS, devices get `192.168.137.x`), up
-to 8 devices, on a channel and width the adapter's driver picks. Per-device speed limits, blocking devices and
-data used per device need a packet filter driver on Windows; they aren't in it yet.
+- **On/off switch**, the hotspot's state, its devices and its live speed, and a **QR code** to join
+- **Name, password** (show it, or generate one), **band** (5 / 2.4 GHz), **which Wi-Fi adapter** hosts it, and
+  **turn on automatically** when you sign in
+- **Devices**: connected now (and offline ones, if you like), with their name, maker, IP, MAC, **live speed**,
+  **speed limit** and **data used**; search them and sort by any column. Click one to rename it, give it its own
+  speed or a **fixed IP**, or to **disconnect**, **block** or **forget** it
+- **Speed for everyone** (each device its own lane), **custom speeds with bursts**, and a **cap for the whole
+  hotspot**
+- **Advanced**: max devices, keeping devices from seeing each other, the **hotspot IP**, **DHCP range**, **lease
+  time** and **DNS servers**, and the **log**
+
+Windows decides a few things itself, so they're shown but greyed: the channel and channel width (the adapter's
+driver picks them), the country (Windows' region), hiding the network name (Windows can't), and the subnet mask
+(always /24). It takes up to 8 devices. "Disconnect" stops a device's connection for a minute, since Windows
+can't push a device off its hotspot.
+
+How it works: the window uses Windows' hotspot API, as the Settings app does. What needs administrator rights
+is done by a small **helper service** (`HotspotManager`), as `hotspotctl` does on Linux: speed limits (token
+buckets per device, like the Linux `tc` setup), blocking and data used go through
+[WinDivert](https://reqrypt.org/windivert.html), a signed open-source packet driver; when you change the DHCP
+range, lease time, DNS servers or give a device a fixed IP, the helper answers the devices' DHCP requests
+itself; and it sets the hotspot's IP. Signed-in users talk to it through a named pipe; it checks everything it's
+given. Its log is in `%ProgramData%\Hotspot Manager`.
 
 **Install** (Windows 10 2004 or later): with [Rust](https://rustup.rs) installed,
 
@@ -48,8 +61,12 @@ cd hotspot-manager-linux
 powershell -ExecutionPolicy Bypass -File windows\install.ps1
 ```
 
-That builds it and adds **Hotspot Manager** to the Start menu and the desktop, for your user only
-(`windows\install.ps1 -Uninstall` removes it). `hotspot-manager --turn-on` turns the hotspot on without a window.
+That builds it, asks for administrator rights once, and installs it in `C:\Program Files\Hotspot Manager` with
+the helper service and WinDivert, in the Start menu and on the desktop (`windows\install.ps1 -Uninstall`
+removes it all). **Microsoft Defender often flags WinDivert** as potentially unwanted, because malware uses
+packet drivers too: if the installer says it couldn't set it up, allow it in Windows Security → Protection
+history, and run the installer again. Without it, everything but speed limits, blocking and data used works.
+`hotspot-manager --turn-on` turns the hotspot on without a window.
 
 ## Why not NetworkManager's built-in hotspot?
 

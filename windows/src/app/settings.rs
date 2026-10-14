@@ -46,7 +46,7 @@ impl Settings {
         names.extend(adapters.iter().map(|(_, name)| name.clone()));
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let adapter = window.choice(&names, 0, |_| {});
-        let sign_in = window.switch(startup::enabled(), |on| {
+        let sign_in = window.checkbox("Turn on automatically when I sign in", startup::enabled(), |on| {
             if !startup::set(on) {
                 super::app().say("Windows didn't let the app start at sign-in", true);
             }
@@ -56,17 +56,21 @@ impl Settings {
             the PC's own Wi-Fi for its internet.");
         window.set_text_color(note, theme::DIM);
         let save = window.default_button("Save", || super::app().save_settings());
-        let labels = ["Network name", "Password", "Band", "Wi-Fi adapter", "Turn on when I sign in"].map(|l| window.name(l));
+        let advanced = window.button("Advanced…", || super::advanced::open(&super::app()));
+        let labels = ["Network name", "Password", "Band", "Wi-Fi adapter"].map(|l| window.name(l));
         let (x, mut y) = (24 + 150 + 12, PAGE + 22);
-        for (i, (control, width)) in [(name, 300), (password, 300), (band, 200), (adapter, 410), (sign_in, 44)].into_iter().enumerate() {
+        for (i, (control, width)) in [(name, 300), (password, 300), (band, 300), (adapter, 410)].into_iter().enumerate() {
             place(labels[i], 24, y + (FIELD - LINE) / 2, 150, LINE);
             place(control, x, y, width, FIELD);
             y += FIELD + 14;
         }
+        place(sign_in, x, y, 360, 26);
+        y += 26 + 14;
         place(generate, x + 310, PAGE + 22 + FIELD + 14, 100, FIELD);
         place(note, 24, y + 6, WIDTH - 48, 3 * LINE + 6);
         place(save, WIDTH - 24 - 110, HEIGHT - 24 - FIELD - 2, 110, FIELD + 2);
-        let mut controls = vec![name, password, generate, band, adapter, sign_in, note, save];
+        place(advanced, 24, HEIGHT - 24 - FIELD - 2, 130, FIELD + 2);
+        let mut controls = vec![name, password, generate, band, adapter, sign_in, note, save, advanced];
         controls.extend(labels);
         Settings { controls, name, password, band, adapter, adapters, filled: Cell::new(false) }
     }

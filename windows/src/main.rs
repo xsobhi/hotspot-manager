@@ -4,14 +4,20 @@
 //!
 //!   hotspot-manager             open the window (or bring the open one forward)
 //!   hotspot-manager --turn-on   turn the hotspot on and exit (at sign-in)
+//!   hotspot-manager --service   the helper, as the HotspotManager service (Windows starts it)
+//!   hotspot-manager --helper    the helper in a console, as administrator (for trying it)
 
 #![windows_subsystem = "windows"] // no console window behind the app
 
 mod app;
+mod client;
+mod helper;
 mod hotspot;
 mod net;
+mod rules;
 mod startup;
 mod store;
+mod vendor;
 #[allow(dead_code)] // (the look is TurboDM's, shared: not all of it is used here)
 mod theme;
 #[allow(dead_code)]
@@ -19,6 +25,11 @@ mod wnd;
 mod worker;
 
 fn main() {
-    let turn_on = std::env::args().any(|a| a == "--turn-on");
-    std::process::exit(if turn_on { startup::turn_on() } else { app::run() });
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    std::process::exit(match mode.as_str() {
+        "--turn-on" => startup::turn_on(),
+        "--service" => helper::service::run(),
+        "--helper" => helper::run_here(),
+        _ => app::run(),
+    });
 }
