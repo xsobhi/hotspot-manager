@@ -19,7 +19,8 @@ pub fn run(app: &Rc<App>) {
     let Some(script) = script() else {
         return app.say("install.ps1 isn't next to the program: run it from the hotspot-manager-linux folder", true);
     };
-    let args = format!("-NoProfile -ExecutionPolicy Bypass -File \"{}\"", script.display());
+    // (-Elevated: it has the rights already, from this request)
+    let args = format!("-NoProfile -ExecutionPolicy Bypass -File \"{}\" -Elevated", script.display());
     // SAFETY: asks Windows to run PowerShell as administrator (it shows its own prompt)
     let result = unsafe {
         ShellExecuteW(Some(app.window.hwnd()), w!("runas"), w!("powershell.exe"), &HSTRING::from(args), None, SW_SHOWNORMAL)

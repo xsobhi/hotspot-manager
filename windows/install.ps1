@@ -53,8 +53,9 @@ try {
 
     Step "Copying the app to $dir"
     New-Item -ItemType Directory -Force $dir | Out-Null
-    Copy-Item $source $exe -Force
-    Copy-Item $PSCommandPath (Join-Path $dir "install.ps1") -Force
+    # (run from the installed copy, they're there already)
+    if ($source -ne $exe) { Copy-Item $source $exe -Force }
+    if ($PSCommandPath -ne (Join-Path $dir "install.ps1")) { Copy-Item $PSCommandPath (Join-Path $dir "install.ps1") -Force }
 
     if (-not (Test-Path (Join-Path $dir "WinDivert.dll"))) {
         Step "Downloading WinDivert 2.2.2"
@@ -86,8 +87,8 @@ try {
 
     if (-not (Get-Service $service -ErrorAction SilentlyContinue)) {
         Step "Adding the helper service"
-        sc.exe create $service binPath= "`"$exe`" --service" start= auto DisplayName= "Hotspot Manager" | Out-Null
-        sc.exe description $service "Counts, limits and blocks the devices on the Wi-Fi hotspot, and gives out their addresses (Hotspot Manager)" | Out-Null
+        New-Service -Name $service -BinaryPathName "`"$exe`" --service" -DisplayName "Hotspot Manager" -StartupType Automatic `
+            -Description "Counts, limits and blocks the devices on the Wi-Fi hotspot, and gives out their addresses (Hotspot Manager)" | Out-Null
         sc.exe failure $service reset= 86400 actions= restart/5000/restart/5000/restart/60000 | Out-Null
     }
     Step "Starting the helper service"
