@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows-numerics = "0.2" # (Direct2D's points)
 windows = { version = "0.61", features = [
-    "Foundation", "Foundation_Collections", "Devices_WiFi", "Networking", "Networking_Connectivity",
+    "Foundation", "Foundation_Collections", "Devices_WiFi", "Devices_WiFiDirect", "Security_Credentials", "Networking", "Networking_Connectivity",
     "Networking_NetworkOperators",
     "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus",

@@ -26,10 +26,16 @@ pub fn gateway() -> [u8; 4] {
     }
 }
 
-/// The hotspot's adapter, while it's on: the one with the hotspot's address.
+/// The hotspot's adapter, while it's on: the one with the hotspot's address; or, for the
+/// local-only hotspot, Windows' Wi-Fi Direct adapter with an address.
 pub fn hotspot_adapter() -> Option<Adapter> {
     let gateway = gateway();
-    adapters().into_iter().find(|a| a.up && a.ipv4.contains(&gateway))
+    let all = adapters();
+    let wifi_direct = |a: &Adapter| a.up && a.name.contains("Wi-Fi Direct") && a.ipv4.iter().any(|ip| ip[..2] != [169, 254]);
+    match all.iter().position(|a| a.up && a.ipv4.contains(&gateway)) {
+        Some(i) => all.into_iter().nth(i),
+        None => all.into_iter().find(wifi_direct),
+    }
 }
 
 /// The devices Windows has seen on an adapter lately: (address, MAC "aa:bb:…").
