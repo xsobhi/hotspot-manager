@@ -69,6 +69,12 @@ fn show(app: &Rc<App>, found: Found) {
         }
     });
     me.set(gw);
+    // Windows' hotspot may keep its own address (192.168.137.1) until the PC restarts
+    let now_at = net::hotspot_adapter().and_then(|a| a.ipv4.iter().copied().find(|ip| ip[..2] != [169, 254]))
+        .filter(|ip| *ip != gateway);
+    let kept = dim(&now_at.map(|ip| format!("Windows is keeping the hotspot at {} for now: {} may need the PC to restart.",
+                                            ip_text(ip), ip_text(gateway))).unwrap_or_default());
+    window.set_text_color(kept, theme::DANGER);
     let to_word = window.label("to");
     let mask = window.choice(&["255.255.255.0   (/24)"], 0, |_| {});
     let lease_names: Vec<&str> = LEASES.iter().map(|(_, n)| *n).collect();
@@ -136,6 +142,12 @@ fn show(app: &Rc<App>, found: Found) {
     place(network_note, 20, y + 24, WIDTH - 40, LINE + 4);
     y += 52;
     row("Hotspot IP (gateway)", gw, 180, &mut y);
+    if now_at.is_some() {
+        place(kept, X, y - 6, WIDTH - X - 20, 2 * LINE + 4);
+        y += 2 * LINE;
+    } else {
+        wnd::set_visible(kept, false);
+    }
     row("Subnet mask", mask, 220, &mut y);
     name("DHCP range", y);
     place(from, X, y, 160, FIELD);

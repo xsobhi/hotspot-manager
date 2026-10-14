@@ -65,7 +65,6 @@ pub fn rows(app: &App) -> Vec<Row> {
         let blocked = rules.as_ref().is_some_and(|r| r.blocked.contains(mac));
         let dot = if blocked { Dot::Blocked } else if ip.is_some() { Dot::Online } else { Dot::Offline };
         let ip = ip.unwrap_or(d.ip.as_str());
-        let usage = helper.as_ref().ok().and_then(|h| h.usage.iter().find(|u| u.mac == *mac || (!ip.is_empty() && u.ip == ip)));
         let (down, up) = rates.get(ip).filter(|_| dot == Dot::Online).map_or((0.0, 0.0), |r| (r.3, r.4));
         let (limit, own_limit) = match rules.as_ref() {
             None => (String::new(), false),
@@ -79,7 +78,7 @@ pub fn rows(app: &App) -> Vec<Row> {
         let here = online.iter().any(|(m, _)| *m == mac);
         let sub = if here { ip.to_string() } else { format!("offline · {}", ago(d.last_seen)) };
         let words = [name.as_str(), &d.host, ip, mac, vendor::of(mac)].join(" ").to_lowercase();
-        let used = usage.filter(|_| here).map(|u| u.down_bytes + u.up_bytes);
+        let used = helper.as_ref().ok().and_then(|h| h.used(mac, ip)).filter(|_| here);
         Row { mac: mac.clone(), dot, name, sub, down, up, limit, own_limit, used, words }
     }).collect()
 }
