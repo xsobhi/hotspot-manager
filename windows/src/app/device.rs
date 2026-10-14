@@ -24,11 +24,10 @@ pub fn open(app: &Rc<App>, mac: &str) {
     let status = app.status.borrow().clone();
     let client_now = status.as_ref().and_then(|s| s.as_ref().ok()).and_then(|s| s.clients.iter().find(|c| c.mac == mac).cloned());
     let online = client_now.is_some();
-    let used = app.helper.borrow().as_ref().ok()
-        .and_then(|h| h.usage.iter().find(|u| u.mac == mac).map(|u| u.down_bytes + u.up_bytes));
+    let ip_now = client_now.as_ref().and_then(|c| c.ip.clone()).unwrap_or_default();
+    let used = app.helper.borrow().as_ref().ok().and_then(|h| h.used(mac, &ip_now));
     let mut facts = if online {
-        let ip = client_now.as_ref().and_then(|c| c.ip.clone()).unwrap_or_default();
-        vec![format!("Connected for {}", span(now().saturating_sub(device.since.unwrap_or(now())))), ip,
+        vec![format!("Connected for {}", span(now().saturating_sub(device.since.unwrap_or(now())))), ip_now,
              used.map(|u| format!("used {}", human_bytes(u))).unwrap_or_default()]
     } else {
         vec![format!("Offline, last seen {}", ago(device.last_seen)), device.ip.clone()]

@@ -103,6 +103,14 @@ pub struct HelperStatus {
     pub usage: Vec<Usage>,
 }
 
+impl HelperStatus {
+    /// The bytes a device used, at all the addresses it had (the helper counts by address).
+    pub fn used(&self, mac: &str, ip: &str) -> Option<u64> {
+        let mine = self.usage.iter().filter(|u| u.mac == mac || (u.mac.is_empty() && !ip.is_empty() && u.ip == ip));
+        mine.fold(None, |sum, u| Some(sum.unwrap_or(0) + u.down_bytes + u.up_bytes))
+    }
+}
+
 /// "no limit", "500 kbps", "2 Mbps", "2.5 Mbps".
 pub fn fmt_limit(kbit: u32) -> String {
     match kbit {
