@@ -1,6 +1,6 @@
 [package]
 name = "hotspot-manager"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Windows' Wi-Fi hotspot on the adapter you pick, with its devices, a QR code and start at sign-in"
 license = "MIT"

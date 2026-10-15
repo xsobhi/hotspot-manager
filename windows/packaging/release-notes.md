@@ -1,3 +1,8 @@
+## What's new in 1.1.1
+
+- **Internet on networks that block sharing.** Some networks send packets with a TTL of 1, so that what a PC shares dies on the way (laptops on the hotspot had no internet). Packets arriving with TTL 1 or 2 are now raised before Windows forwards them, as MyPublicWiFi does.
+- **DNS that works for laptops**: devices get this PC's own DNS servers instead of Windows' sharing relay, which refused some of their questions.
+
 ## What's new in 1.1.0
 
 - **Upload speed limits work.** Windows' sharing sent uploads on by itself; the limiter now holds them where they really leave, so blocking and "Share internet" off stop uploads too.
