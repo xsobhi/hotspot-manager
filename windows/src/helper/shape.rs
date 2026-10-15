@@ -17,6 +17,9 @@ const QUEUE_TIME: f64 = 0.15;
 const QUEUE_BYTES: usize = 64 * 1024;
 /// A packet that waited longer for its turn is dropped instead (as CoDel's target, roughly).
 const MAX_WAIT: Duration = Duration::from_millis(100);
+/// Packets up to this size go ahead of the big ones; at most this many of them wait.
+const SMALL: usize = 300;
+const SMALL_PACKETS: usize = 64;
 
 /// Bytes a second from kbit/s.
 fn bytes(kbit: u32) -> f64 {
@@ -69,21 +72,28 @@ pub fn buckets(rate_kbit: u32, burst_kbit: u32, burst_secs: u32, now: Instant) -
     }
 }
 
-/// One device's traffic in one direction, under its limit.
+/// One device's traffic in one direction, under its limit. Small packets (pings, DNS, games'
+/// updates, TCP's acknowledgements) wait apart from the big ones and go first, still within the
+/// limit: they don't wait behind a download (as cake's and fq_codel's sparse flows don't).
 pub struct Lane<P> {
     pub limit: (u32, u32, u32), // (kbit/s, burst kbit/s, burst seconds): to notice changes
     rate: Option<Bucket>, // none: only the whole hotspot's cap applies
     peak: Option<Bucket>,
-    queue: VecDeque<(P, usize, Instant)>, // the packet, its size, since when it waits
-    queued: usize,
-    room: usize, // the bytes the queue may hold
+    queues: [VecDeque<(P, usize, Instant)>; 2], // [small, big]: the packet, its size, since when it waits
+    queued: usize, // the big ones' bytes waiting
+    room: usize,   // the bytes they may hold
+}
+
+/// Which queue a packet of `n` bytes waits in: 0, the small ones'.
+fn which(n: usize) -> usize {
+    (n > SMALL) as usize
 }
 
 impl<P> Lane<P> {
     pub fn new(limit: (u32, u32, u32), now: Instant) -> Lane<P> {
         let (rate, peak) = buckets(limit.0, limit.1, limit.2, now);
         let room = if limit.0 == 0 { QUEUE_BYTES } else { (bytes(limit.0) * QUEUE_TIME) as usize };
-        Lane { limit, rate, peak, queue: VecDeque::new(), queued: 0, room: room.max(4 * MTU as usize) }
+        Lane { limit, rate, peak, queues: [VecDeque::new(), VecDeque::new()], queued: 0, room: room.max(4 * MTU as usize) }
     }
 
     fn fits(&mut self, n: usize, now: Instant) -> bool {
@@ -97,52 +107,64 @@ impl<P> Lane<P> {
         }
     }
 
-    /// A new packet: Some(it) to send now, or None (it waits, or is dropped when the queue is full).
+    /// A new packet: Some(it) to send now, or None (it waits, or is dropped when its queue is full).
     pub fn offer(&mut self, packet: P, n: usize, mut total: Option<&mut Bucket>, now: Instant) -> Option<P> {
-        if self.queue.is_empty() && self.fits(n, now) && total.as_deref_mut().is_none_or(|t| t.has(n as f64, now)) {
+        let q = which(n);
+        // on at once when nothing waits ahead of it (for a small one: no other small one)
+        let ahead = if q == 0 { !self.queues[0].is_empty() } else { self.waiting() };
+        if !ahead && self.fits(n, now) && total.as_deref_mut().is_none_or(|t| t.has(n as f64, now)) {
             if let Some(t) = total {
                 t.take(n as f64);
             }
             self.spend(n);
             return Some(packet);
         }
-        if self.queue.len() < QUEUE_PACKETS && self.queued + n <= self.room {
-            self.queue.push_back((packet, n, now));
-            self.queued += n;
+        let room = if q == 0 { self.queues[0].len() < SMALL_PACKETS } else {
+            self.queues[1].len() < QUEUE_PACKETS && self.queued + n <= self.room
+        };
+        if room {
+            self.queues[q].push_back((packet, n, now));
+            if q == 1 {
+                self.queued += n;
+            }
         }
         None
     }
 
-    /// The waiting packets that may go now; how many were dropped for waiting too long.
+    /// The waiting packets that may go now, small ones first; how many were dropped for waiting
+    /// too long.
     pub fn release(&mut self, mut total: Option<&mut Bucket>, now: Instant, out: &mut Vec<P>) -> usize {
         let mut dropped = 0;
-        while let Some(&(_, n, since)) = self.queue.front() {
-            if now.saturating_duration_since(since) > MAX_WAIT {
-                self.queue.pop_front();
-                self.queued -= n;
-                dropped += 1;
-                continue;
+        for q in 0..2 {
+            while let Some(&(_, n, since)) = self.queues[q].front() {
+                let late = now.saturating_duration_since(since) > MAX_WAIT;
+                if !late && (!self.fits(n, now) || total.as_mut().is_some_and(|t| !t.has(n as f64, now))) {
+                    return dropped; // (the speed limit's reached: the rest wait)
+                }
+                let (packet, _, _) = self.queues[q].pop_front().unwrap();
+                if q == 1 {
+                    self.queued -= n;
+                }
+                if late {
+                    dropped += 1;
+                    continue;
+                }
+                self.spend(n);
+                if let Some(t) = total.as_mut() {
+                    t.take(n as f64);
+                }
+                out.push(packet);
             }
-            if !self.fits(n, now) || total.as_mut().is_some_and(|t| !t.has(n as f64, now)) {
-                break;
-            }
-            self.spend(n);
-            if let Some(t) = total.as_mut() {
-                t.take(n as f64);
-            }
-            let (packet, _, _) = self.queue.pop_front().unwrap();
-            self.queued -= n;
-            out.push(packet);
         }
         dropped
     }
 
     pub fn waiting(&self) -> bool {
-        !self.queue.is_empty()
+        self.queues.iter().any(|q| !q.is_empty())
     }
 
     pub fn waiting_count(&self) -> usize {
-        self.queue.len()
+        self.queues.iter().map(VecDeque::len).sum()
     }
 }
 
@@ -213,6 +235,32 @@ mod tests {
         assert!(longest <= MAX_WAIT, "{longest:?}");
         let kbit = (sent * 1500) as f64 * 8.0 / 5.0 / 1000.0;
         assert!((1900.0..2150.0).contains(&kbit), "{kbit}");
+    }
+
+    #[test]
+    fn small_packets_go_first() {
+        // a download filling 2 Mbps, and a ping every 50 ms: the pings hardly wait
+        let start = Instant::now();
+        let mut lane: Lane<(Instant, bool)> = Lane::new((2000, 0, 0), start);
+        let (mut out, mut longest, mut pings) = (vec![], Duration::ZERO, 0);
+        for ms in 0..5000u64 {
+            let now = start + Duration::from_millis(ms);
+            for _ in 0..4 {
+                let _ = lane.offer((now, false), 1500, None, now);
+            }
+            if ms % 50 == 0 && lane.offer((now, true), 80, None, now).is_some() {
+                pings += 1;
+            }
+            lane.release(None, now, &mut out);
+            for (since, ping) in out.drain(..) {
+                if ping {
+                    longest = longest.max(now - since);
+                    pings += 1;
+                }
+            }
+        }
+        assert_eq!(pings, 100); // (none dropped)
+        assert!(longest <= Duration::from_millis(5), "{longest:?}");
     }
 
     #[test]
