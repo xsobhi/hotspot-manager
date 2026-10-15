@@ -1,3 +1,12 @@
+## What's new in 1.1.0
+
+- **Upload speed limits work.** Windows' sharing sent uploads on by itself; the limiter now holds them where they really leave, so blocking and "Share internet" off stop uploads too.
+- **Low latency under a speed limit**: short queues, and small packets (pings, games, DNS) go ahead of downloads. A speed test at the limit went from 3 seconds of latency to about 30 ms over idle.
+- **Smoother speed tests**: TCP slows down early instead of stalling when a long queue overflows.
+- **The adapter you choose hosts**: Windows gives Wi-Fi Direct to one Wi-Fi card at a time; it's moved to the chosen one (a USB adapter plugged in again, say).
+- **Internet sharing that doesn't get stuck** after an adapter comes or goes, and the hotspot no longer turns itself off after a few seconds.
+- **Time connected** in the device list; the hotspot IP is checked (private, and not a network this PC is on).
+
 ## Hotspot Manager for Windows
 
 The Windows version of Hotspot Manager: a Wi-Fi hotspot from this PC's internet, on its own Wi-Fi or a USB Wi-Fi adapter, with the Linux app's controls.
