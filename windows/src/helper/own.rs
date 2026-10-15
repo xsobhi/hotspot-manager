@@ -26,6 +26,8 @@ pub struct Own {
     shared: bool,              // through Windows' sharing (else: the address set, the helper's DHCP)
     #[serde(skip)]
     tries: (u32, Option<Instant>), // sharing it: how often, and when last
+    #[serde(skip)]
+    refused: String, // why Windows' sharing refused it last
 }
 
 impl Own {
@@ -39,6 +41,7 @@ impl Own {
             internet_id: internet.as_ref().map(|a| braced(&format!("{:?}", a.id))).unwrap_or_default(),
             shared: false,
             tries: (0, None),
+            refused: String::new(),
         };
         save(RECORD, &own); // (before: undone even if the helper stops halfway)
         let address = ip_text(gateway);
@@ -67,8 +70,11 @@ impl Own {
                 save(RECORD, &*self);
                 log::line(format!("Sharing the internet with the hotspot at {}", ip_text(self.gateway)));
             }
-            Err(why) if self.tries.0 == 1 => log::line(format!("Windows' sharing didn't take the hotspot (trying again): {why}")),
             Err(why) if self.tries.0 == 30 => log::line(format!("Windows' sharing still doesn't take the hotspot: {why}")),
+            Err(why) if why != self.refused => {
+                log::line(format!("Windows' sharing didn't take the hotspot (trying again): {why}"));
+                self.refused = why;
+            }
             Err(_) => {}
         }
     }
@@ -110,25 +116,33 @@ impl Own {
 /// service gets in its way (it refuses with 0x80040201), so it's stopped first (it isn't hosting:
 /// the app is); `afresh`: Windows' sharing restarts too, when it refused before.
 fn share(public: &str, private: &str, afresh: bool) -> Result<(), String> {
-    let restart = if afresh { "Restart-Service SharedAccess -Force -ErrorAction SilentlyContinue" } else { "" };
+    // Windows' sharing keeps which connections it shares (WMI, root\Microsoft\HomeNet): one that
+    // went away while shared (a Wi-Fi Direct adapter Windows moved to another Wi-Fi card) makes it
+    // refuse anything new, and can't be unshared the usual way, so its marks are cleared there;
+    // then (or when it refused before) it starts again, and takes a moment before it takes anything
+    let afresh_ps = if afresh { "true" } else { "false" };
     powershell(&format!("Stop-Service icssvc -Force -ErrorAction SilentlyContinue
-        {restart}
+        $stale = @(Get-CimInstance -Namespace root/Microsoft/HomeNet -ClassName HNet_ConnectionProperties -ErrorAction SilentlyContinue |
+            Where-Object {{ ($_.IsIcsPrivate -or $_.IsIcsPublic) -and @('{public}', '{private}') -notcontains $_.Connection.Guid }})
+        foreach ($s in $stale) {{ Set-CimInstance -InputObject $s -Property @{{ IsIcsPrivate = $false; IsIcsPublic = $false }} -ErrorAction SilentlyContinue }}
+        if ($stale.Count -or ${afresh_ps}) {{ Restart-Service SharedAccess -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 4 }}
         $ErrorActionPreference = 'Stop'
+        function Step($what, [scriptblock]$do) {{ try {{ & $do }} catch {{ throw \"$what ($($_.Exception.Message))\" }} }}
         $m = New-Object -ComObject HNetCfg.HNetShare
         $public = $null; $private = $null
         foreach ($c in @($m.EnumEveryConnection)) {{
-            $guid = $m.NetConnectionProps.Invoke($c).Guid
+            $props = $m.NetConnectionProps.Invoke($c)
             $s = $m.INetSharingConfigurationForINetConnection.Invoke($c)
-            if ($guid -eq '{public}') {{ $public = $s }}
-            elseif ($guid -eq '{private}') {{ $private = $s }}
-            elseif ($s.SharingEnabled) {{ $s.DisableSharing() }}
+            if ($props.Guid -eq '{public}') {{ $public = $s }}
+            elseif ($props.Guid -eq '{private}') {{ $private = $s }}
+            elseif ($s.SharingEnabled) {{ try {{ $s.DisableSharing() }} catch {{ }} }}
         }}
         if (-not $public) {{ throw \"it doesn't list the internet connection\" }}
         if (-not $private) {{ throw \"it doesn't list the hotspot's adapter\" }}
-        if ($public.SharingEnabled -and $public.SharingConnectionType -ne 0) {{ $public.DisableSharing() }}
-        if ($private.SharingEnabled -and $private.SharingConnectionType -ne 1) {{ $private.DisableSharing() }}
-        if (-not $public.SharingEnabled) {{ $public.EnableSharing(0) }}
-        if (-not $private.SharingEnabled) {{ $private.EnableSharing(1) }}")).map(|_| ())
+        Step 'unsharing the internet connection first' {{ if ($public.SharingEnabled -and $public.SharingConnectionType -ne 0) {{ $public.DisableSharing() }} }}
+        Step 'unsharing the hotspot adapter first' {{ if ($private.SharingEnabled -and $private.SharingConnectionType -ne 1) {{ $private.DisableSharing() }} }}
+        Step 'sharing the internet connection' {{ if (-not $public.SharingEnabled) {{ $public.EnableSharing(0) }} }}
+        Step 'sharing it with the hotspot adapter' {{ if (-not $private.SharingEnabled) {{ $private.EnableSharing(1) }} }}")).map(|_| ())
 }
 
 fn unshare_script(ids: &[&str]) -> String {

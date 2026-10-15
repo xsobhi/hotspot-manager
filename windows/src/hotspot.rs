@@ -122,11 +122,10 @@ fn local_status(band: Band) -> Status {
 }
 
 pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
-    if local::running() || !online() {
-        // (the band Windows keeps for its own hotspot, when it can say: the one chosen before)
-        let band = manager(adapter).ok().filter(|_| online()).and_then(|m| m.GetCurrentAccessPointConfiguration().ok())
-            .map(|c| band_of(&c));
-        return Ok(local_status(band.unwrap_or(Band::Any)));
+    // the app's own hotspot: Windows' mobile hotspot isn't asked anything (asking starts its
+    // service, which takes over the Wi-Fi Direct adapter's sharing, at 192.168.137.1)
+    if local::running() || !online() || own_address() {
+        return Ok(local_status(Band::Any));
     }
     let m = manager(adapter)?;
     let state = match m.TetheringOperationalState() {
@@ -137,9 +136,6 @@ pub fn status(adapter: Option<GUID>) -> Result<Status, String> {
     };
     let config = m.GetCurrentAccessPointConfiguration().map_err(|e| message(&e))?;
     let band = band_of(&config);
-    if state == State::Off && own_address() {
-        return Ok(local_status(band)); // (turning it on starts the app's own)
-    }
     Ok(Status {
         state,
         ssid: config.Ssid().map(|s| s.to_string()).unwrap_or_default(),

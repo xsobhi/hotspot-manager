@@ -192,7 +192,8 @@ impl App {
                     Err(why) => result = result.and(Err(why)),
                 }
             }
-            if !local {
+            // (Windows' own hotspot's settings: not for the app's own, which keeps them itself)
+            if !local && !hotspot::own_address() {
                 result = result.and_then(|()| hotspot::configure(adapter, &ssid, &password, band));
             }
             if was_on {
