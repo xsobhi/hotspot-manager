@@ -76,7 +76,13 @@ pub fn rows(app: &App) -> Vec<Row> {
         };
         let name = name(mac, d);
         let here = online.iter().any(|(m, _)| *m == mac);
-        let sub = if here { ip.to_string() } else { format!("offline · {}", ago(d.last_seen)) };
+        // (on since: as the helper saw it come, else since this window saw it)
+        let since = helper.as_ref().ok().and_then(|h| h.since(mac)).or(d.since);
+        let sub = match since {
+            _ if !here => format!("offline · {}", ago(d.last_seen)),
+            Some(since) => format!("{ip} · {}", span(now().saturating_sub(since))), // (connected for)
+            None => ip.to_string(),
+        };
         let words = [name.as_str(), &d.host, ip, mac, vendor::of(mac)].join(" ").to_lowercase();
         let used = helper.as_ref().ok().and_then(|h| h.used(mac, ip)).filter(|_| here);
         Row { mac: mac.clone(), dot, name, sub, down, up, limit, own_limit, used, words }

@@ -101,6 +101,17 @@ fn show(app: &Rc<App>, found: Found) {
         if f[..3] != g[..3] || t[..3] != g[..3] || f[3] > t[3] {
             return a.say("The DHCP range must be in the hotspot's subnet (the same first three numbers), low to high", true);
         }
+        // as on Linux: a private address, and not a network this PC is on already (its internet's, say)
+        let private = g[0] == 10 || (g[0] == 172 && (16..=31).contains(&g[1])) || (g[0] == 192 && g[1] == 168);
+        if !private || g[3] == 0 || g[3] == 255 {
+            return a.say("The hotspot IP must be a private address: 10.x.x.x, 172.16–31.x.x or 192.168.x.x", true);
+        }
+        let hotspot = net::hotspot_adapter().map(|h| h.index);
+        let taken = net::adapters().into_iter().filter(|x| x.up && Some(x.index) != hotspot)
+            .find(|x| x.ipv4.iter().any(|ip| ip[..3] == g[..3]));
+        if let Some(other) = taken {
+            return a.say(format!("{} is on {}.{}.{}.x already: pick another hotspot IP", other.friendly, g[0], g[1], g[2]), true);
+        }
         let servers: Vec<String> = text(dns).replace([',', ';'], " ").split_whitespace().map(String::from).collect();
         let lease_hours = LEASES[choice_index(lease)].0;
         let (max_devices, apart) = (text(max).parse().unwrap_or(0), is_checked(isolate));

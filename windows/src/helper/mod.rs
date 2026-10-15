@@ -38,6 +38,7 @@ pub struct Shared {
     pub lanes: Lanes,
     pub leases: Leases,
     pub online: Vec<String>,             // devices on it now, in the order they came
+    pub since: HashMap<String, u64>,     // MAC → when it came (on now)
     pub hosts: HashMap<String, String>,  // MAC → the name it gave DHCP
     pub problem: String,                 // why the traffic engine isn't working, if it isn't
     pub hosting: Option<Instant>,        // when the app's own hotspot last said it's on (own.rs)
@@ -186,6 +187,11 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>, own: bool)
         }
     }
     let time = now();
+    let online = s.online.clone();
+    s.since.retain(|mac, _| online.contains(mac));
+    for mac in online {
+        s.since.entry(mac).or_insert(time);
+    }
     s.rules.cut.retain(|_, until| *until > time);
 }
 

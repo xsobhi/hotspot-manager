@@ -46,6 +46,7 @@ fn handle(request: Request) -> Result<Value, String> {
                 mac: s.macs.get(ip).cloned().unwrap_or_default(),
                 ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
                 host: s.macs.get(ip).and_then(|m| s.hosts.get(m)).cloned().unwrap_or_default(),
+                since: s.macs.get(ip).and_then(|m| s.since.get(m)).copied().unwrap_or(0),
                 down_bytes: *down,
                 up_bytes: *up,
                 ..Default::default()

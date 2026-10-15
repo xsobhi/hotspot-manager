@@ -91,6 +91,7 @@ pub struct Usage {
     pub down_bytes: u64, // to the device, since the helper started
     pub up_bytes: u64,
     pub host: String, // the name it gave DHCP
+    pub since: u64,   // on since (Unix time; 0: not on)
     pub down_rate: f64, // bits a second, now
     pub up_rate: f64,
 }
@@ -104,6 +105,11 @@ pub struct HelperStatus {
 }
 
 impl HelperStatus {
+    /// Since when a device is on the hotspot, as the helper saw it come.
+    pub fn since(&self, mac: &str) -> Option<u64> {
+        self.usage.iter().find(|u| u.mac == mac && u.since > 0).map(|u| u.since)
+    }
+
     /// The bytes a device used, at all the addresses it had (the helper counts by address).
     pub fn used(&self, mac: &str, ip: &str) -> Option<u64> {
         let mine = self.usage.iter().filter(|u| u.mac == mac || (u.mac.is_empty() && !ip.is_empty() && u.ip == ip));
