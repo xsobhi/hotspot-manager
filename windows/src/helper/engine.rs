@@ -9,7 +9,7 @@
 //! twice). So the first is counted and noted (Translations), and the second, matched to its
 //! device by that note, is the one held to the device's limit.
 
-use super::divert::{Address, Divert, LAYER_FORWARD};
+use super::divert::{Address, Divert, LAYER_FORWARD, LAYER_NETWORK};
 use super::shape::{self, Bucket, Lane};
 use super::{log, Shared};
 use crate::helper::dhcp::Ip;
@@ -107,6 +107,7 @@ fn flow_key(p: &[u8]) -> Option<(u8, Ip, u16, u16)> {
 pub struct Engine {
     divert: Arc<Divert>,
     uploads: Arc<Divert>,
+    ttl: Option<Arc<Divert>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -125,6 +126,35 @@ impl Engine {
         let uploads = format!("ip and {} and {}", inside("SrcAddr"), outside("DstAddr"));
         let divert = Arc::new(Divert::open(&filter, LAYER_FORWARD, PRIORITY)?);
         let uploads = Arc::new(Divert::sniff(&uploads, LAYER_FORWARD)?);
+        // some networks send their packets with TTL 1, so that what a PC shares (forwards) dies on
+        // the way (Windows takes one off, and drops it at 0): those coming in are raised to 64
+        // first, as MyPublicWiFi does (only they come through here; the PC itself doesn't mind)
+        let ttl = internet.and_then(|i| match Divert::open(&format!("inbound and ifIdx == {i} and ip and ip.TTL <= 2"), LAYER_NETWORK, PRIORITY) {
+            Ok(d) => Some(Arc::new(d)),
+            Err(why) => {
+                log::line(format!("Can't raise the internet's TTL: {why}"));
+                None
+            }
+        });
+        let raising = ttl.clone().map(|t| {
+            let s = shared.clone();
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 65535];
+                while let Some((n, mut address)) = t.recv(&mut buffer) {
+                    let packet = &mut buffer[..n];
+                    if n >= 20 && packet[0] >> 4 == 4 {
+                        packet[8] = 64;
+                        Divert::checksums(packet, &mut address);
+                        let mut s = s.lock().unwrap();
+                        if s.ttl_fixed == 0 {
+                            log::line("The network sends packets with TTL 1 or 2 (to stop sharing): raising it for the hotspot's devices");
+                        }
+                        s.ttl_fixed += 1;
+                    }
+                    t.send(packet, &address);
+                }
+            })
+        });
         let (u, s) = (uploads.clone(), shared.clone());
         let counting = std::thread::spawn(move || {
             let mut buffer = vec![0u8; 65535];
@@ -177,13 +207,18 @@ impl Engine {
             }
         });
         log::line(format!("Counting and limiting the hotspot's traffic ({net}.x)"));
-        Ok(Engine { divert, uploads, stop, threads: vec![capture, release, counting] })
+        let mut threads = vec![capture, release, counting];
+        threads.extend(raising);
+        Ok(Engine { divert, uploads, ttl, stop, threads })
     }
 
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         self.divert.shutdown();
         self.uploads.shutdown();
+        if let Some(t) = &self.ttl {
+            t.shutdown();
+        }
         for thread in self.threads {
             let _ = thread.join();
         }

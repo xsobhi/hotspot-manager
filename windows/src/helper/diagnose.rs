@@ -52,6 +52,26 @@ pub fn diagnose(gateway: Ip, hotspot: u32) {
             log::line(format!("  {key}: {count} packets, {bytes} bytes"));
         }
     }
+    // which TTLs the packets from the internet come with (a network stopping sharing sends 1)
+    let ttls = Arc::new(Mutex::new(std::collections::BTreeMap::<u8, u64>::new()));
+    if let Ok(divert) = Divert::sniff(&format!("inbound and ip and ifIdx == {internet}"), LAYER_NETWORK) {
+        let divert = Arc::new(divert);
+        let (d, t) = (divert.clone(), ttls.clone());
+        let watcher = std::thread::spawn(move || {
+            let mut buffer = vec![0u8; 65535];
+            while let Some((n, _)) = d.recv(&mut buffer) {
+                if n >= 20 {
+                    *t.lock().unwrap().entry(buffer[8]).or_default() += 1;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_secs(10));
+        divert.shutdown();
+        let _ = watcher.join();
+        let ttls: Vec<String> = ttls.lock().unwrap().iter().map(|(ttl, n)| format!("{ttl}: {n}")).collect();
+        log::line(format!("Diagnosis, the internet's packets by TTL: {}", ttls.join(", ")));
+    }
+    log::line(format!("Diagnosis, packets with TTL 1 or 2 raised so far: {}", shared().lock().unwrap().ttl_fixed));
     let after = shared().lock().unwrap().counts;
     for (i, name) in ["up", "down"].iter().enumerate() {
         let (a, b) = (after[i], before[i]);

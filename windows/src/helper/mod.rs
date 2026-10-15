@@ -44,6 +44,7 @@ pub struct Shared {
     pub hosting: Option<Instant>,        // when the app's own hotspot last said it's on (own.rs)
     pub counts: [engine::Counts; 2],     // what the engine did with the packets [up, down]
     pub translations: engine::Translations, // whose uploads Windows' sharing translated
+    pub ttl_fixed: u64,                  // packets from the internet with TTL 1 or 2, raised
 }
 
 impl Shared {
@@ -166,8 +167,9 @@ fn upkeep(shared: &Arc<Mutex<Shared>>, running: &mut Option<Running>, own: bool)
         if let Some(d) = r.dhcp.take() {
             d.stop();
         } else {
-            // the DNS server: Windows' sharing answers at the hotspot's address; without it, the PC's own
-            let dns = if own { net::internet_dns().unwrap_or([1, 1, 1, 1]) } else { gateway };
+            // the DNS server: the PC's own (Windows' sharing's relay at the hotspot's address refuses
+            // some devices' questions, and laptops have only it); without one, the relay
+            let dns = net::internet_dns().unwrap_or(if own { [1, 1, 1, 1] } else { gateway });
             match dhcpd::DhcpServer::start(shared.clone(), gateway, dns, adapter.index) {
                 Ok(d) => r.dhcp = Some(d),
                 Err(e) => log::line(format!("Can't give out addresses: {e}")),
