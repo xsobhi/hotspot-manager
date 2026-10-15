@@ -164,8 +164,10 @@ impl Engine {
                         let ((_, down), lane) = &mut lanes.lanes[i];
                         if lane.waiting() {
                             let before = out.len();
-                            lane.release(lanes.totals[*down as usize].as_mut(), now, &mut out);
-                            shared.counts[*down as usize].released += (out.len() - before) as u64;
+                            let late = lane.release(lanes.totals[*down as usize].as_mut(), now, &mut out);
+                            let counts = &mut shared.counts[*down as usize];
+                            counts.released += (out.len() - before) as u64;
+                            counts.dropped += late as u64;
                         }
                     }
                 }

@@ -1,15 +1,22 @@
 //! Speed limits as Linux's tc does them for the Linux app: a token bucket per device and
 //! direction (HTB-like lanes, so each device gets its own speed), a second, faster bucket for
 //! short bursts (TBF's peak rate), and one more for the whole hotspot. Packets over the limit
-//! wait in a short queue; when that's full they're dropped, which is how TCP learns to slow down.
+//! wait in a short queue, and are dropped when it's full or they waited too long: that's how TCP
+//! learns to slow down, early and smoothly. A long queue delays everything behind it, pings too
+//! (seconds of "loaded latency", "bufferbloat"), and TCP only slows when it overflows, in bursts.
 
 use crate::rules::Limit;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MTU: f64 = 1514.0;
 const QUEUE_PACKETS: usize = 300;
-const QUEUE_BYTES: usize = 512 * 1024;
+/// The most a lane holds: what it sends in this long at its speed (for no speed of its own, as
+/// under the whole hotspot's cap only, QUEUE_BYTES).
+const QUEUE_TIME: f64 = 0.15;
+const QUEUE_BYTES: usize = 64 * 1024;
+/// A packet that waited longer for its turn is dropped instead (as CoDel's target, roughly).
+const MAX_WAIT: Duration = Duration::from_millis(100);
 
 /// Bytes a second from kbit/s.
 fn bytes(kbit: u32) -> f64 {
@@ -67,14 +74,16 @@ pub struct Lane<P> {
     pub limit: (u32, u32, u32), // (kbit/s, burst kbit/s, burst seconds): to notice changes
     rate: Option<Bucket>, // none: only the whole hotspot's cap applies
     peak: Option<Bucket>,
-    queue: VecDeque<(P, usize)>,
+    queue: VecDeque<(P, usize, Instant)>, // the packet, its size, since when it waits
     queued: usize,
+    room: usize, // the bytes the queue may hold
 }
 
 impl<P> Lane<P> {
     pub fn new(limit: (u32, u32, u32), now: Instant) -> Lane<P> {
         let (rate, peak) = buckets(limit.0, limit.1, limit.2, now);
-        Lane { limit, rate, peak, queue: VecDeque::new(), queued: 0 }
+        let room = if limit.0 == 0 { QUEUE_BYTES } else { (bytes(limit.0) * QUEUE_TIME) as usize };
+        Lane { limit, rate, peak, queue: VecDeque::new(), queued: 0, room: room.max(4 * MTU as usize) }
     }
 
     fn fits(&mut self, n: usize, now: Instant) -> bool {
@@ -97,16 +106,23 @@ impl<P> Lane<P> {
             self.spend(n);
             return Some(packet);
         }
-        if self.queue.len() < QUEUE_PACKETS && self.queued + n <= QUEUE_BYTES {
-            self.queue.push_back((packet, n));
+        if self.queue.len() < QUEUE_PACKETS && self.queued + n <= self.room {
+            self.queue.push_back((packet, n, now));
             self.queued += n;
         }
         None
     }
 
-    /// The waiting packets that may go now.
-    pub fn release(&mut self, mut total: Option<&mut Bucket>, now: Instant, out: &mut Vec<P>) {
-        while let Some(&(_, n)) = self.queue.front() {
+    /// The waiting packets that may go now; how many were dropped for waiting too long.
+    pub fn release(&mut self, mut total: Option<&mut Bucket>, now: Instant, out: &mut Vec<P>) -> usize {
+        let mut dropped = 0;
+        while let Some(&(_, n, since)) = self.queue.front() {
+            if now.saturating_duration_since(since) > MAX_WAIT {
+                self.queue.pop_front();
+                self.queued -= n;
+                dropped += 1;
+                continue;
+            }
             if !self.fits(n, now) || total.as_mut().is_some_and(|t| !t.has(n as f64, now)) {
                 break;
             }
@@ -114,10 +130,11 @@ impl<P> Lane<P> {
             if let Some(t) = total.as_mut() {
                 t.take(n as f64);
             }
-            let (packet, _) = self.queue.pop_front().unwrap();
+            let (packet, _, _) = self.queue.pop_front().unwrap();
             self.queued -= n;
             out.push(packet);
         }
+        dropped
     }
 
     pub fn waiting(&self) -> bool {
@@ -171,6 +188,31 @@ mod tests {
         assert!(first > 3400.0, "{first}");
         let long = throughput((2000, 4000, 2), 20.0) * 8.0 / 20.0 / 1000.0;
         assert!(long < 2400.0, "{long}");
+    }
+
+    #[test]
+    fn keeps_the_queue_short() {
+        // a sender pushing far over 2 Mbps: nothing waits much longer than MAX_WAIT (as pings
+        // behind it would), and the rate holds
+        let start = Instant::now();
+        let mut lane: Lane<Instant> = Lane::new((2000, 0, 0), start);
+        let (mut out, mut longest, mut sent) = (vec![], Duration::ZERO, 0usize);
+        for ms in 0..5000u64 {
+            let now = start + Duration::from_millis(ms);
+            for _ in 0..4 {
+                if lane.offer(now, 1500, None, now).is_some() {
+                    sent += 1;
+                }
+            }
+            lane.release(None, now, &mut out);
+            for since in out.drain(..) {
+                longest = longest.max(now - since);
+                sent += 1;
+            }
+        }
+        assert!(longest <= MAX_WAIT, "{longest:?}");
+        let kbit = (sent * 1500) as f64 * 8.0 / 5.0 / 1000.0;
+        assert!((1900.0..2150.0).contains(&kbit), "{kbit}");
     }
 
     #[test]
